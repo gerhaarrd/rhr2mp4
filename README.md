@@ -191,3 +191,7 @@ muxed into the final output.
 
 When `--hw auto` is enabled, the project probes available encoders and tries
 NVENC, VAAPI, or QSV before falling back to CPU encoding.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
