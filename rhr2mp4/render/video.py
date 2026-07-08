@@ -198,6 +198,12 @@ def _resolve_runtime(skin, parallax_enabled, trail_enabled, background_dots_enab
             runtime_skin.cursor_trail_color = tuple(color_overrides["trail"])
         if "border" in color_overrides:
             runtime_skin.border_color = tuple(color_overrides["border"])
+        if "panel_color" in color_overrides:
+            runtime_skin.panel_color = tuple(color_overrides["panel_color"])
+        if "panel_opacity" in color_overrides:
+            runtime_skin.panel_background_opacity = color_overrides["panel_opacity"]
+        if "panel_gap" in color_overrides:
+            runtime_skin.panel_gap = color_overrides["panel_gap"]
     return runtime_skin
 
 

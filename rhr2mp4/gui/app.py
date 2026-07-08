@@ -1332,16 +1332,47 @@ class MainWindow(QWidget):
         notes_row.addStretch(1)
         editors.addWidget(self._wrap_labeled("Note colors (cycle)", self._hbox_widget(notes_row)))
 
-        # Cursor / trail / border single colors
+        # Cursor / trail / border / panel single colors
         singles_row = QHBoxLayout()
         singles_row.setSpacing(18)
         self.cursor_swatch = ColorSwatch("#ffffff")
         self.trail_swatch = ColorSwatch("#ffffff")
         self.border_swatch = ColorSwatch("#ffffff")
-        for label, swatch in (("Cursor", self.cursor_swatch), ("Trail", self.trail_swatch), ("Border", self.border_swatch)):
+        self.panel_swatch = ColorSwatch("#000000")
+        for label, swatch in (("Cursor", self.cursor_swatch), ("Trail", self.trail_swatch),
+                              ("Border", self.border_swatch), ("Panel bg", self.panel_swatch)):
             singles_row.addWidget(self._wrap_labeled(label, swatch))
         singles_row.addStretch(1)
         editors.addLayout(singles_row)
+
+        # Panel background opacity/size: the rounded card behind the stat
+        # rows (ACCURACY, POINTS...). Many skins import an oversized/opaque
+        # one, so this is overridable independently of its color.
+        panel_row = QHBoxLayout()
+        panel_row.setSpacing(18)
+        self.panel_opacity_spin = QDoubleSpinBox()
+        self.panel_opacity_spin.setRange(0.0, 100.0)
+        self.panel_opacity_spin.setSingleStep(5.0)
+        self.panel_opacity_spin.setDecimals(0)
+        self.panel_opacity_spin.setSuffix(" %")
+        self.panel_opacity_spin.setValue(40.0)
+        panel_row.addWidget(self._wrap_labeled("Panel opacity", self.panel_opacity_spin))
+        self.panel_size_spin = QDoubleSpinBox()
+        self.panel_size_spin.setRange(0.0, 60.0)
+        self.panel_size_spin.setSingleStep(2.0)
+        self.panel_size_spin.setDecimals(0)
+        self.panel_size_spin.setSuffix(" px")
+        self.panel_size_spin.setValue(14.0)
+        self.panel_size_spin.setToolTip("Padding around the text inside the panel card (bigger = bigger box).")
+        panel_row.addWidget(self._wrap_labeled("Panel size", self.panel_size_spin))
+        panel_row.addStretch(1)
+        editors.addLayout(panel_row)
+
+        # Re-run the preview so panel tweaks are visible right away (like
+        # the music/hitsound volume controls do).
+        self.panel_swatch.colorChanged.connect(self._schedule_auto_preview)
+        self.panel_opacity_spin.valueChanged.connect(self._schedule_auto_preview)
+        self.panel_size_spin.valueChanged.connect(self._schedule_auto_preview)
 
         v.addWidget(self._editors_box)
         card.set_body_widget(body)
@@ -1431,6 +1462,9 @@ class MainWindow(QWidget):
             self.cursor_swatch.set_hex(preset.get("cursor", "#ffffff"))
             self.trail_swatch.set_hex(preset.get("trail", "#ffffff"))
             self.border_swatch.set_hex(preset.get("border", "#ffffff"))
+            self.panel_swatch.set_hex(preset.get("panel", "#000000"))
+            self.panel_opacity_spin.setValue(float(preset.get("panel_opacity", 40)))
+            self.panel_size_spin.setValue(float(preset.get("panel_size", 14)))
         self._save_color_settings()
 
     def _collect_colors(self) -> dict:
@@ -1439,6 +1473,9 @@ class MainWindow(QWidget):
             "cursor": self.cursor_swatch.hex(),
             "trail": self.trail_swatch.hex(),
             "border": self.border_swatch.hex(),
+            "panel": self.panel_swatch.hex(),
+            "panel_opacity": self.panel_opacity_spin.value(),
+            "panel_size": self.panel_size_spin.value(),
         }
 
     def _color_overrides(self) -> dict | None:
@@ -1452,6 +1489,9 @@ class MainWindow(QWidget):
             "cursor": _hex_to_rgb(c["cursor"]),
             "trail": _hex_to_rgb(c["trail"]),
             "border": _hex_to_rgb(c["border"]),
+            "panel_color": _hex_to_rgb(c["panel"]),
+            "panel_opacity": c["panel_opacity"] / 100.0,
+            "panel_gap": c["panel_size"],
         }
 
     def _save_color_preset(self):
@@ -1501,6 +1541,9 @@ class MainWindow(QWidget):
             self.cursor_swatch.set_hex(preset.get("cursor", "#ffffff"))
             self.trail_swatch.set_hex(preset.get("trail", "#ffffff"))
             self.border_swatch.set_hex(preset.get("border", "#ffffff"))
+            self.panel_swatch.set_hex(preset.get("panel", "#000000"))
+            self.panel_opacity_spin.setValue(float(preset.get("panel_opacity", 40)))
+            self.panel_size_spin.setValue(float(preset.get("panel_size", 14)))
         else:
             self._set_note_swatches(["#ffffff"])
         self._editors_box.setEnabled(selected != FROM_SKIN_PRESET)
@@ -1839,6 +1882,9 @@ class MainWindow(QWidget):
                     runtime.cursor_color = overrides["cursor"]
                     runtime.cursor_trail_color = overrides["trail"]
                     runtime.border_color = overrides["border"]
+                    runtime.panel_color = overrides["panel_color"]
+                    runtime.panel_background_opacity = overrides["panel_opacity"]
+                    runtime.panel_gap = overrides["panel_gap"]
                 if note_colors:
                     runtime.note_colors = list(note_colors)
                 notes, ghost, chaos, extent, mods_label = resolve_mods(game_map.notes, replay)
