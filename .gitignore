@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Build artifacts (packaging/rhr2mp4.spec IS tracked — the builds need it)
+build/
+dist/
+packaging/build/
+packaging/build-win/
+packaging/dist/
+packaging/dist-win/
+packaging/appimagetool-x86_64.AppImage
+*.AppImage
+*.AppDir/
+
+# Local test material (replays, maps, rendered videos)
+*.rhr
+*.rhm
+*.rhs
+*.mp4
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,72 @@
+# Builds the distributable artifacts on native runners:
+#   - rhr2mp4-x86_64.AppImage      (Linux, needs system ffmpeg at runtime)
+#   - rhr2mp4-windows-x86_64.zip   (Windows, self-contained: bundles ffmpeg.exe)
+# Runs on version tags (v*) and manually via workflow_dispatch.
+# On tags, also publishes a GitHub Release with both files attached.
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux-appimage:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          ./.venv/bin/pip install -r requirements.txt pyinstaller
+      - name: Build AppImage
+        run: PYTHON=./.venv/bin/python ./packaging/build_appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rhr2mp4-x86_64.AppImage
+          path: packaging/dist/rhr2mp4-x86_64.AppImage
+
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm --distpath packaging/dist-win --workpath packaging/build-win packaging/rhr2mp4.spec
+      - name: Bundle ffmpeg and zip
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          $ffmpeg = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $ffmpeg.FullName packaging/dist-win/rhr2mp4/
+          Compress-Archive -Path packaging/dist-win/rhr2mp4 -DestinationPath packaging/dist-win/rhr2mp4-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rhr2mp4-windows-x86_64.zip
+          path: packaging/dist-win/rhr2mp4-windows-x86_64.zip
+
+  release:
+    # Publishes a GitHub Release with both artifacts attached on v* tags
+    needs: [linux-appimage, windows-exe]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            rhr2mp4-x86_64.AppImage
+            rhr2mp4-windows-x86_64.zip

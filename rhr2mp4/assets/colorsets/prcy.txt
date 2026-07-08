@@ -1,0 +1,7 @@
+#ffffff 
+#DBDBDB 
+#C4C4C4 
+#ADADAD 
+#969696 
+#808080 
+#696969
