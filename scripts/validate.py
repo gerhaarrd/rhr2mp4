@@ -1,6 +1,6 @@
-"""Sanity-checks the .rhm / .rhr parsers against real sample files.
+"""Sanity-checks the map (.rhm/.sspm) and .rhr parsers against real sample files.
 
-Usage: python scripts/validate.py path/to/replay.rhr path/to/map.rhm
+Usage: python scripts/validate.py path/to/replay.rhr path/to/map.rhm|map.sspm
 """
 
 import sys
@@ -8,17 +8,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from rhr2mp4.formats import rhm, rhr
+from rhr2mp4.formats import maps, rhr
 
 
 def main():
     if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <replay.rhr> <map.rhm>")
+        print(f"usage: {sys.argv[0]} <replay.rhr> <map.rhm|map.sspm>")
         sys.exit(1)
 
     replay_path, map_path = sys.argv[1], sys.argv[2]
 
-    m = rhm.load(map_path)
+    m = maps.load(map_path)
     print("=== Map ===")
     print("title:", m.metadata.title)
     print("mappers:", m.metadata.mappers)

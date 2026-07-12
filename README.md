@@ -1,16 +1,27 @@
 # rhr2mp4
 
 Converts Rhythia replays (`.rhr`) into `.mp4` videos by reconstructing the run
-from the replay data and its matching map (`.rhm`).
+from the replay data and its matching map (`.rhm`, or a Sound Space Plus `.sspm`).
 
 The project includes:
 
 - a PyQt5 GUI with preview, render queue, and persistent settings
 - a headless CLI renderer
-- automatic `.rhm` detection from the replay
+- automatic map detection (`.rhm` or `.sspm`) from the replay
+- automatic map download from rhythia.com when no local copy is found
+  (verified against the replay's beatmap hash)
 - video rendering with audio, optional intro, partial clips, motion blur, and
-  support for H.264, HEVC, and AV1
+  support for H.264, HEVC, and AV1 — plus `.webm` and animated `.gif` output
+- custom background image, looping video, or animated GIF/WebP (files that
+  ffmpeg can't decode, like animated WebP saved as .gif, are transcoded
+  automatically via Pillow), with a brightness control (darken or brighten)
+- auto-highlight: picks the best clip window (densest section, near-deaths,
+  the fail moment) automatically
+- an optional osu!-style hit-error (timing) bar
+- movable HUD: drag any element (title, panels, combo, health bar, timing
+  bar) on the GUI preview to reposition it, or use `--move` on the CLI
 - visual overrides for HUD, skin, and colorset
+- an `.sspm` → `.rhm` converter (`--convert`)
 
 ## Download
 
@@ -73,12 +84,16 @@ placed next to the executable is picked up automatically (see
 The app opens a large preview on the left and controls on the right. You can:
 
 - drop or select a `.rhr` replay
-- let the app auto-detect the matching `.rhm`
+- let the app auto-detect the matching map (`.rhm` or `.sspm`)
 - load an optional `.rhs` skin, `.txt` colorset, and game directory
 - scrub through the replay with the slider
-- mark clip start and end points
+- mark clip start and end points (or hit **✨ Auto** to auto-pick a highlight)
+- drag HUD elements around on the preview to customize the layout
+  (double-click one to reset it; **↺ Layout** resets everything)
 - render a short preview around the current position
 - queue multiple `.rhr` files and render them sequentially
+- watch a folder so new replays are queued automatically (Options → Optional
+  resources)
 
 When rendering finishes, the app offers actions to play the video and open the
 output folder, and it will try to show a system notification.
@@ -87,10 +102,12 @@ output folder, and it will try to show a system notification.
 
 The options dialog (`Ctrl+O`) contains the main settings:
 
-- **Output**: final `.mp4` path
-- **Render settings**: resolution, FPS, quality, codec, hardware acceleration,
-  audio bitrate, spawn distance, approach rate, trail size, motion blur,
-  parallax, background dots, hit effects, and intro
+- **Output**: final path — the extension picks the container (`.mp4`, `.webm`
+  or `.gif`)
+- **Render settings**: named presets, resolution, FPS, quality, codec,
+  hardware acceleration, audio bitrate, spawn distance, approach rate, trail
+  size, motion blur, parallax, background dots, hit effects, intro, and a
+  custom background image/video/gif with a brightness control
 - **HUD elements**: show or hide title, progress, combo, grade, accuracy,
   score, points, misses, notes, health, speed, and other HUD items
 - **Optional resources**: `.rhs` skin, `.txt` colorset, game directory
@@ -105,13 +122,15 @@ Settings persist across sessions.
 When `main.py` receives arguments, it runs without opening the GUI:
 
 ```bash
-./.venv/bin/python main.py replay.rhr [map.rhm] -o out.mp4
+./.venv/bin/python main.py replay.rhr [map.rhm|map.sspm] -o out.mp4
 ```
 
 If the map is omitted, the program looks for it:
 
 - in the replay's directory
 - in `exports/` inside `--game-dir`, when provided
+- failing that, it downloads the map from rhythia.com by the replay's online
+  id (cached in `~/.cache/rhr2mp4/maps`; disable with `--no-download`)
 
 More complete example:
 
@@ -154,17 +173,35 @@ Useful CLI options:
 - `--trail-length PCT`
 - `--motion-blur off|filter|subframe`
 - `--blur-intensity PCT`
-- `--clip START-END`
+- `--clip START-END` or `--clip auto[:SECONDS]` (auto-picked highlight)
 - `--intro`
 - `--hide title,progress,combo,...|all`
+- `--timing-bar` (osu!-style hit-error bar)
+- `--move ELEM=DX,DY` — move a HUD element by percent of the canvas
+  (repeatable; elements: title, combo, left_panel, right_panel, health,
+  timing; e.g. `--move health=0,5 --move title=0,80`)
+- `--bg-image PATH` / `--bg-video PATH` (videos and gifs loop) /
+  `--bg-brightness PCT` (100 = untouched, lower darkens, up to 200 brightens)
+- `--no-download`
+- `--convert OUT.rhm` (convert an `.sspm` map to `.rhm` and exit)
 - `--workers N`
 
 Use `--help` for the full argument list.
 
+## Tests
+
+```bash
+./.venv/bin/python -m unittest discover tests
+```
+
+The suite covers the `.rhr`/`.rhm`/`.sspm` parsers (including old format
+versions), map lookup, hit matching, and the highlight finder, all on
+synthetic files.
+
 ## Parser Validation
 
 ```bash
-./.venv/bin/python scripts/validate.py replay.rhr map.rhm
+./.venv/bin/python scripts/validate.py replay.rhr map.rhm  # or map.sspm
 ```
 
 This script checks whether the parsers read both files consistently, including
@@ -176,17 +213,19 @@ map IDs, note counts, accuracy, and duration.
   arguments
 - `rhr2mp4/cli.py`: headless command-line interface
 - `rhr2mp4/gui/`: PyQt5 application and stylesheet
-- `rhr2mp4/formats/`: parsers for `.rhr`, `.rhm`, `.rhs`, plus map lookup
+- `rhr2mp4/formats/`: parsers for `.rhr`, `.rhm`, `.sspm`, `.rhs`, map lookup,
+  and the rhythia.com map downloader
 - `rhr2mp4/sim/`: hit registration, timeline generation, and mod handling
 - `rhr2mp4/render/`: frame composition, intro rendering, audio, and video
   pipeline
 - `scripts/validate.py`: quick parser sanity checks
+- `tests/`: unit tests (`python -m unittest discover tests`)
 
 ## Rendering Pipeline
 
 The replay is parsed, converted into a visual timeline, and rendered in
 parallel segments. Each worker draws frames and encodes its own segment with
-`ffmpeg`; at the end, the segments are concatenated and the `.rhm` audio is
+`ffmpeg`; at the end, the segments are concatenated and the map's audio is
 muxed into the final output.
 
 When `--hw auto` is enabled, the project probes available encoders and tries

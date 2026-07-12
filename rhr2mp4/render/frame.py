@@ -98,6 +98,61 @@ class RenderContext:
     # downscaled to a cheap-to-resize working size; None = plain dot.
     cursor_sprite: Image.Image | None = None
     cursor_trail_sprite: Image.Image | None = None
+    # Per-frame background source (custom video backgrounds): called with the
+    # state's song time and returns an RGB frame already at canvas size, or
+    # None to fall back to base_background. Set only inside render workers.
+    background_provider: object | None = None
+    # Static playfield clip (the square the notes/cursor layer is cut to);
+    # prebuilt because it's identical for every frame.
+    playfield_clip_mask: Image.Image | None = None
+    # User layout tweaks: HUD element name -> (dx, dy) as fractions of the
+    # canvas width/height. Shared by reference with the GUI's drag editor,
+    # so mutating the dict moves elements without rebuilding the context.
+    element_offsets: dict | None = None
+
+
+# HUD elements whose position the user can adjust (GUI drag editor and the
+# CLI --move flag). Keys of RenderContext.element_offsets.
+MOVABLE_ELEMENTS = ("title", "combo", "left_panel", "right_panel", "health", "timing")
+
+
+def _element_offset(ctx: "RenderContext", name: str) -> tuple[int, int]:
+    off = (ctx.element_offsets or {}).get(name)
+    if not off:
+        return 0, 0
+    return round(off[0] * ctx.width), round(off[1] * ctx.height)
+
+
+def element_rects(ctx: "RenderContext") -> dict[str, tuple[float, float, float, float]]:
+    """Approximate canvas-space bounding boxes (x, y, w, h) of each movable
+    HUD element, offsets included -- the GUI's drag editor hit-tests these.
+    Mirrors the placement math of the _draw_* functions below."""
+    ox, oy = ctx.playfield_origin
+    size = ctx.playfield_size
+    w, h = ctx.width, ctx.height
+    skin = ctx.skin
+
+    rects: dict[str, tuple[float, float, float, float]] = {
+        "title": (ox, h * 0.012, size, h * 0.088),
+        "health": (ox, oy + size + h * 0.018, size, h * 0.055),
+        "timing": (ox + size * 0.20, oy + size - size * 0.09, size * 0.60, size * 0.07),
+    }
+    combo_cy = oy + size * (skin.combo_text_vertical_position_percent / 100.0)
+    rects["combo"] = (ox + size * 0.34, combo_cy - ctx.font_combo.size * 0.8,
+                      size * 0.32, ctx.font_combo.size * 1.6)
+    if ctx.portrait:
+        panel_y = oy + size + h * 0.06
+        rects["left_panel"] = (ox + size * 0.10, panel_y, size * 0.30, h * 0.15)
+        rects["right_panel"] = (ox + size * 0.60, panel_y, size * 0.30, h * 0.15)
+    else:
+        rects["left_panel"] = (ox - size * 0.24 - size * 0.12, oy + size * 0.18, size * 0.24, size * 0.62)
+        rects["right_panel"] = (ox + size + size * 0.24 - size * 0.12, oy + size * 0.18, size * 0.24, size * 0.62)
+
+    out = {}
+    for name, (x, y, rw, rh) in rects.items():
+        dx, dy = _element_offset(ctx, name)
+        out[name] = (x + dx, y + dy, rw, rh)
+    return out
 
 
 def _apply_tint(img: Image.Image, tint_rgb: tuple[int, int, int], tint_opacity: float) -> Image.Image:
@@ -111,7 +166,29 @@ def _apply_tint(img: Image.Image, tint_rgb: tuple[int, int, int], tint_opacity: 
     return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), mode="RGBA")
 
 
-def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: RuntimeSkin) -> tuple[Image.Image, Image.Image | None]:
+def fit_cover(img: Image.Image, width: int, height: int) -> Image.Image:
+    """Scales + center-crops an image to exactly fill width x height
+    (CSS object-fit: cover)."""
+    scale = max(width / img.width, height / img.height)
+    img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.LANCZOS)
+    left = (img.width - width) // 2
+    top = (img.height - height) // 2
+    return img.crop((left, top, left + width, top + height))
+
+
+def apply_brightness(img: Image.Image, factor: float) -> Image.Image:
+    """Scales an RGB image's brightness: 1.0 = untouched, < 1 darkens (so
+    custom backgrounds don't wash out the notes and HUD), > 1 brightens
+    (clipped at white)."""
+    if abs(factor - 1.0) < 1e-3:
+        return img
+    factor = max(0.0, factor)
+    return Image.eval(img, lambda v: min(255, int(v * factor)))
+
+
+def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: RuntimeSkin,
+                     background_image_bytes: bytes | None = None,
+                     background_brightness: float = 0.4) -> tuple[Image.Image, Image.Image | None]:
     if skin.background_rgb is not None:
         top = bottom = np.array(skin.background_rgb, dtype=np.float32)
     else:
@@ -123,6 +200,13 @@ def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: R
     gradient = (top[None, :] + (bottom - top)[None, :] * t).astype(np.uint8)
     gradient = np.repeat(gradient[:, None, :], width, axis=1)
     bg = Image.fromarray(gradient, mode="RGB").convert("RGBA")
+
+    if background_image_bytes:
+        # User-chosen background image: fills the canvas (darkened by
+        # default for legibility) but keeps any skin decoration layers on
+        # top of it.
+        custom = Image.open(io.BytesIO(background_image_bytes)).convert("RGB")
+        bg = apply_brightness(fit_cover(custom, width, height), background_brightness).convert("RGBA")
 
     if skin.background_layers:
         for layer in skin.background_layers:
@@ -160,7 +244,10 @@ def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: R
 
 
 def build_context(width: int, height: int, cover_bytes: bytes | None, skin: RuntimeSkin | None = None,
-                  playfield_extent: float = 1.5) -> RenderContext:
+                  playfield_extent: float = 1.5,
+                  background_image_bytes: bytes | None = None,
+                  background_brightness: float = 0.4,
+                  element_offsets: dict | None = None) -> RenderContext:
     if skin is None:
         skin = resolve_skin(None)
 
@@ -194,7 +281,9 @@ def build_context(width: int, height: int, cover_bytes: bytes | None, skin: Runt
     font_panel_label = ImageFont.truetype(FONT_BOLD, size=max(6, int(ref * 0.024 * skin.interface_values_font_size)))
     font_panel_value = ImageFont.truetype(FONT_BOLD, size=max(8, int(ref * 0.028 * skin.interface_values_font_size)))
 
-    bg, cover_thumb = _make_background(width, height, cover_bytes, skin)
+    bg, cover_thumb = _make_background(width, height, cover_bytes, skin,
+                                       background_image_bytes=background_image_bytes,
+                                       background_brightness=background_brightness)
 
     border_resized = None
     border_origin = (0, 0)
@@ -228,6 +317,13 @@ def build_context(width: int, height: int, cover_bytes: bytes | None, skin: Runt
     cursor_sprite = _prep_texture(skin.cursor_image, skin.cursor_color)
     cursor_trail_sprite = _prep_texture(skin.cursor_trail_image, skin.cursor_trail_color)
 
+    # The notes/cursor layer is clipped to the playfield square every frame;
+    # the mask never changes, so build it once here.
+    clip_mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(clip_mask).rectangle(
+        [playfield_left, playfield_top, playfield_left + playfield_size, playfield_top + playfield_size],
+        fill=255)
+
     return RenderContext(
         width=width,
         height=height,
@@ -240,13 +336,17 @@ def build_context(width: int, height: int, cover_bytes: bytes | None, skin: Runt
         font_combo=font_combo,
         font_panel_label=font_panel_label,
         font_panel_value=font_panel_value,
-        base_background=bg,
+        # Stored pre-converted to RGBA: draw_frame copies it every frame and
+        # a same-mode copy is much cheaper than an RGB->RGBA convert.
+        base_background=bg.convert("RGBA"),
         portrait=portrait,
         cover_thumb=cover_thumb,
         border_resized=border_resized,
         border_origin=border_origin,
         cursor_sprite=cursor_sprite,
         cursor_trail_sprite=cursor_trail_sprite,
+        playfield_clip_mask=clip_mask,
+        element_offsets=element_offsets,
     )
 
 
@@ -296,7 +396,11 @@ def _draw_default_border(draw, ox, oy, size, color, opacity):
 
 
 def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, replay: Replay) -> Image.Image:
-    img = ctx.base_background.copy().convert("RGBA")
+    if ctx.background_provider is not None:
+        bg = ctx.background_provider(state.time_ms)
+        img = bg.convert("RGBA") if bg is not None else ctx.base_background.copy()
+    else:
+        img = ctx.base_background.copy()
     overlay = Image.new("RGBA", (ctx.width, ctx.height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
@@ -325,9 +429,7 @@ def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, 
     _draw_cursor(ctx, playfield_layer, cursor_scene, ox, oy)
     _draw_miss_effect(ctx, playfield_layer, state, ox, oy, size)
 
-    clip_mask = Image.new("L", (ctx.width, ctx.height), 0)
-    ImageDraw.Draw(clip_mask).rectangle([ox, oy, ox + size, oy + size], fill=255)
-    playfield_layer.putalpha(ImageChops.multiply(playfield_layer.getchannel("A"), clip_mask))
+    playfield_layer.putalpha(ImageChops.multiply(playfield_layer.getchannel("A"), ctx.playfield_clip_mask))
     overlay.alpha_composite(playfield_layer)
 
     if ctx.border_resized is not None:
@@ -343,13 +445,16 @@ def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, 
     _draw_combo(ctx, overlay, draw, state, ox, oy, size)
     _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size)
     _draw_health_bar(ctx, draw, state, replay, ox, oy, size)
+    if skin.hit_error_bar_enabled:
+        _draw_hit_error_bar(ctx, draw, state, ox, oy, size)
 
     if skin.song_info_enabled:
         _draw_title_block(ctx, draw, map_meta, replay, state, ox, oy, size)
 
     _draw_fail_vignette(ctx, overlay, state)
 
-    return Image.alpha_composite(img, overlay).convert("RGB")
+    img.alpha_composite(overlay)  # in place: skips one full-frame allocation
+    return img.convert("RGB")
 
 
 def draw_frame_blurred(ctx: RenderContext, timeline, map_meta: MapMetadata, replay: Replay,
@@ -402,7 +507,7 @@ def draw_intro_card(ctx: RenderContext, map_meta: MapMetadata, replay: Replay,
     """The static intro screen (see video.py's intro segment): big rounded
     cover art, title, player line and a stats row on the map background.
     Drawn once; the per-frame fade is applied by the caller."""
-    img = ctx.base_background.copy().convert("RGBA")
+    img = ctx.base_background.copy()  # already RGBA (see build_context)
     draw = ImageDraw.Draw(img, "RGBA")
     w, h = ctx.width, ctx.height
     ref = min(w, h)
@@ -765,10 +870,11 @@ def _draw_combo(ctx, overlay, draw, state, ox, oy, size):
     skin = ctx.skin
     if not skin.combo_text_enabled:
         return
+    dx, dy = _element_offset(ctx, "combo")
     combo_text = f"{state.combo}"
     tw = draw.textlength(combo_text, font=ctx.font_combo)
-    tx = ox + size / 2 - tw / 2
-    ty = oy + size * (skin.combo_text_vertical_position_percent / 100.0) - ctx.font_combo.size / 2
+    tx = ox + dx + size / 2 - tw / 2
+    ty = oy + dy + size * (skin.combo_text_vertical_position_percent / 100.0) - ctx.font_combo.size / 2
     alpha = int(255 * skin.combo_text_opacity)
     draw.text((tx, ty), combo_text, font=ctx.font_combo, fill=(*skin.combo_text_color, alpha))
 
@@ -834,6 +940,8 @@ def _draw_panel_card(ctx, overlay, draw, x_center, top_y, rows):
 
 def _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size):
     skin = ctx.skin
+    ldx, ldy = _element_offset(ctx, "left_panel")
+    rdx, rdy = _element_offset(ctx, "right_panel")
     # Measured from the reference recording: panel text centers sit about
     # 0.24 playfield-widths outside the border, vertically ~47% down it.
     # Portrait canvases have no room beside the near-full-width playfield,
@@ -843,6 +951,8 @@ def _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size):
     if ctx.portrait:
         left_x = ox + size * 0.25
         right_x = ox + size * 0.75
+    left_x += ldx
+    right_x += rdx
     row_gap = ctx.font_panel_value.size * 2.2
 
     left_rows = []
@@ -863,7 +973,7 @@ def _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size):
         left_top = right_top_portrait = panels_top
     else:
         left_top = oy + size * 0.47 - (len(left_rows) - 1) * row_gap / 2
-    _draw_panel_card(ctx, overlay, draw, left_x, left_top, left_rows)
+    _draw_panel_card(ctx, overlay, draw, left_x, left_top + ldy, left_rows)
 
     # The replay stores only the *final* score/points totals, not their
     # accrual over time (and in-game accrual isn't linear -- combo
@@ -887,7 +997,7 @@ def _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size):
         right_top = right_top_portrait
     else:
         right_top = oy + size * 0.47 - (len(right_rows) - 1) * row_gap / 2
-    _draw_panel_card(ctx, overlay, draw, right_x, right_top, right_rows)
+    _draw_panel_card(ctx, overlay, draw, right_x, right_top + rdy, right_rows)
 
 
 def _draw_title_block(ctx, draw, map_meta, replay, state, ox, oy, size):
@@ -897,25 +1007,27 @@ def _draw_title_block(ctx, draw, map_meta, replay, state, ox, oy, size):
     playfield, not under it."""
     w = ctx.width
     skin = ctx.skin
+    dx, dy = _element_offset(ctx, "title")
 
     title = f"Watching {replay.username} play {map_meta.title}"
     tw = draw.textlength(title, font=ctx.font_title)
-    draw.text((w / 2 - tw / 2, ctx.height * 0.022), title, font=ctx.font_title, fill=(255, 255, 255, 255))
+    draw.text((w / 2 - tw / 2 + dx, ctx.height * 0.022 + dy), title, font=ctx.font_title, fill=(255, 255, 255, 255))
 
     time_str = f"{_format_time(state.time_ms)} / {_format_time(replay.length_ms)}"
     tsw = draw.textlength(time_str, font=ctx.font_small)
-    draw.text((w / 2 - tsw / 2, ctx.height * 0.058), time_str, font=ctx.font_small, fill=(235, 235, 240, 255))
+    draw.text((w / 2 - tsw / 2 + dx, ctx.height * 0.058 + dy), time_str, font=ctx.font_small, fill=(235, 235, 240, 255))
 
     if skin.progress_bar_enabled:
         bar_h = max(3, round(ctx.height * 0.0065))
-        bar_y = round(ctx.height * 0.092)
+        bar_y = round(ctx.height * 0.092) + dy
+        bar_x = ox + dx
         length = replay.length_ms or 1.0
         prog = min(1.0, max(0.0, state.time_ms / length))
         alpha = int(255 * skin.progress_bar_alpha)
-        draw.rounded_rectangle([ox, bar_y, ox + size, bar_y + bar_h], radius=bar_h / 2, fill=(255, 255, 255, 60))
+        draw.rounded_rectangle([bar_x, bar_y, bar_x + size, bar_y + bar_h], radius=bar_h / 2, fill=(255, 255, 255, 60))
         if prog > 0:
             draw.rounded_rectangle(
-                [ox, bar_y, ox + max(bar_h, size * prog), bar_y + bar_h],
+                [bar_x, bar_y, bar_x + max(bar_h, size * prog), bar_y + bar_h],
                 radius=bar_h / 2,
                 fill=(*skin.progress_bar_color, alpha),
             )
@@ -951,11 +1063,13 @@ def _draw_health_bar(ctx, draw, state, replay, ox, oy, size):
     bar, then the current grade (with the speed-modifier suffix, e.g.
     "S--" at 0.8x) centered under it."""
     skin = ctx.skin
-    grade_y = oy + size + ctx.height * 0.028
+    dx, dy = _element_offset(ctx, "health")
+    ox = ox + dx
+    grade_y = oy + size + ctx.height * 0.028 + dy
 
     if skin.health_bar_enabled:
         bar_h = max(3, round(ctx.height * 0.011))
-        bar_y = oy + size + round(ctx.height * 0.028)
+        bar_y = oy + size + round(ctx.height * 0.028) + dy
         frac = max(0.0, min(1.0, state.health_pct / 100.0))
         alpha = int(255 * skin.health_bar_alpha)
         if frac > 0:
@@ -975,6 +1089,48 @@ def _draw_health_bar(ctx, draw, state, replay, ox, oy, size):
         label += "  " + ctx.mods_label
     gw = draw.textlength(label, font=ctx.font_small)
     draw.text((ox + size / 2 - gw / 2, grade_y), label, font=ctx.font_small, fill=(255, 255, 255, 255))
+
+
+def _draw_hit_error_bar(ctx, draw, state, ox, oy, size):
+    """osu!-style timing bar along the bottom inside of the playfield: one
+    tick per recent hit, placed by how early (left) or late (right) it was,
+    fading out over ERROR_BAR_WINDOW_MS, plus a marker at the running mean.
+    Uses the hit-matching window (sim/hitreg.py) as the full scale."""
+    from ..sim.hitreg import DEFAULT_WINDOW_MS
+    from ..sim.timeline import ERROR_BAR_WINDOW_MS
+
+    dx, dy = _element_offset(ctx, "timing")
+    half_w = size * 0.28
+    cx = ox + size / 2 + dx
+    cy = oy + size - size * 0.055 + dy
+    tick_h = max(6, size * 0.030)
+
+    # Baseline + center line (center = perfectly on time).
+    draw.line([cx - half_w, cy, cx + half_w, cy], fill=(255, 255, 255, 60), width=1)
+    draw.line([cx, cy - tick_h * 0.8, cx, cy + tick_h * 0.8], fill=(255, 255, 255, 150), width=2)
+
+    offsets = []
+    for age, offset in state.recent_errors:
+        if offset is None:
+            continue  # misses have no timing to place on the bar
+        fade = max(0.0, 1.0 - age / ERROR_BAR_WINDOW_MS)
+        if fade <= 0:
+            continue
+        offsets.append(offset)
+        frac = max(-1.0, min(1.0, offset / DEFAULT_WINDOW_MS))
+        x = cx + frac * half_w
+        a = abs(offset)
+        color = (120, 230, 130) if a <= 25 else (235, 200, 90) if a <= 50 else (240, 120, 90)
+        draw.line([x, cy - tick_h / 2, x, cy + tick_h / 2],
+                  fill=(*color, int(210 * fade)), width=2)
+
+    if offsets:
+        # Mean-offset marker: a small triangle above the bar.
+        frac = max(-1.0, min(1.0, (sum(offsets) / len(offsets)) / DEFAULT_WINDOW_MS))
+        x = cx + frac * half_w
+        s = tick_h * 0.45
+        draw.polygon([(x, cy - tick_h * 0.75), (x - s / 2, cy - tick_h * 0.75 - s), (x + s / 2, cy - tick_h * 0.75 - s)],
+                     fill=(255, 255, 255, 200))
 
 
 def _draw_fail_vignette(ctx, overlay, state):

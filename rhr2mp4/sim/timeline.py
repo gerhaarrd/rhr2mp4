@@ -45,6 +45,9 @@ HIT_EFFECT_MS = 280.0
 
 POST_WINDOW_MS = max(MISS_FADE_MS, HIT_EFFECT_MS)
 
+# How long a hit/miss stays visible on the hit-error (timing) bar.
+ERROR_BAR_WINDOW_MS = 3000.0
+
 # GHOST mod: the note fades *out* well before its hit moment -- the player
 # clicks from memory. Fade starts about a third of the way in and the note
 # is fully invisible shortly past the midpoint of the approach.
@@ -90,6 +93,10 @@ class TimelineState:
     # Hits within the last HIT_EFFECT_MS, for the hit burst effect
     # (kind="hit", burst = progress 0..1 through the effect).
     recent_hits: list[NoteRenderState] = field(default_factory=list)
+    # Notes resolved within ERROR_BAR_WINDOW_MS, for the hit-error bar:
+    # (age_ms, offset_ms) with offset None for misses. Offset is
+    # hit time - note time, so negative = early, positive = late.
+    recent_errors: list[tuple[float, float | None]] = field(default_factory=list)
 
 
 class Timeline:
@@ -137,6 +144,20 @@ class Timeline:
         self._cum_misses = cum_misses
         self._combo_arr = combo_arr
         self._last_miss_arr = last_miss_arr
+
+        # Every resolved note as (moment it resolved, timing offset), sorted,
+        # for the hit-error bar: a hit resolves at its recorded hit frame
+        # (offset = hit - note time); a miss at the note's own timestamp
+        # (offset None).
+        error_events: list[tuple[float, float | None]] = []
+        for note, res in zip(notes, results):
+            if res.hit and res.hit_ms is not None:
+                error_events.append((res.hit_ms, res.hit_ms - note.time_ms))
+            elif not res.hit:
+                error_events.append((note.time_ms, None))
+        error_events.sort(key=lambda e: e[0])
+        self._error_events = error_events
+        self._error_times = [e[0] for e in error_events]
 
     @property
     def length_ms(self) -> float:
@@ -219,6 +240,10 @@ class Timeline:
 
         cursor_xy = self.replay.cursor_position_at(t)
 
+        err_lo = bisect.bisect_left(self._error_times, t - ERROR_BAR_WINDOW_MS)
+        err_hi = bisect.bisect_right(self._error_times, t)
+        recent_errors = [(t - when, offset) for when, offset in self._error_events[err_lo:err_hi]]
+
         return TimelineState(
             time_ms=t,
             cursor_xy=cursor_xy,
@@ -234,4 +259,5 @@ class Timeline:
             health_pct=self.replay.health_at(t) * 100.0,
             last_miss_ms=self._last_miss_arr[idx],
             recent_hits=recent_hits,
+            recent_errors=recent_errors,
         )

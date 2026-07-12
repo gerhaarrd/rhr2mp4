@@ -83,3 +83,37 @@ def load(path: str) -> Map:
     notes.sort(key=lambda n: n.time_ms)
 
     return Map(metadata=metadata, notes=notes, audio_bytes=audio_bytes, cover_bytes=cover_bytes)
+
+
+def save(map_: Map, path: str) -> None:
+    """Writes a Map back out as an .rhm zip (e.g. to convert an .sspm into
+    the game's own import format). Grid coordinates are kept as ints when
+    they are whole (like the game's encoder) and floats for quantum notes."""
+    meta = map_.metadata
+    doc = {
+        "OnlineId": meta.online_id,
+        "OnlineStatus": meta.online_status,
+        "LegacyId": meta.legacy_id,
+        "SongName": meta.song_name,
+        "Mappers": meta.mappers,
+        "Title": meta.title,
+        "Duration": meta.duration_ms,
+        "Difficulty": meta.difficulty,
+        "CustomDifficultyName": meta.custom_difficulty_name,
+        "StarRating": meta.star_rating,
+        "Notes": [
+            {"Time": n.time_ms,
+             "X": int(n.x) if float(n.x).is_integer() else n.x,
+             "Y": int(n.y) if float(n.y).is_integer() else n.y}
+            for n in map_.notes
+        ],
+        "AudioFileName": "",
+        "ImagePath": "",
+        "TimingPoints": [],
+    }
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("map", json.dumps(doc))
+        if map_.audio_bytes:
+            zf.writestr("audio", map_.audio_bytes)
+        if map_.cover_bytes:
+            zf.writestr("cover", map_.cover_bytes)

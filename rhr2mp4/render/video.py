@@ -37,6 +37,135 @@ from ..sim.timeline import DEFAULT_APPROACH_RATE, DEFAULT_SPAWN_DISTANCE
 def _ffmpeg() -> str:
     return ffmpeg_exe() or "ffmpeg"
 
+
+def _probe_duration_s(path: str) -> float:
+    """Media duration in seconds via ffprobe (looked up next to the ffmpeg
+    in use, then on PATH); 0.0 when it can't be determined."""
+    candidates = []
+    ff = ffmpeg_exe()
+    if ff:
+        name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        candidates.append(os.path.join(os.path.dirname(ff), name))
+    probe = next((c for c in candidates if os.path.isfile(c)), None) or shutil.which("ffprobe")
+    if not probe:
+        return 0.0
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+        ).stdout.decode().strip()
+        return max(0.0, float(out))
+    except Exception:
+        return 0.0
+
+def _probe_decodable(path: str) -> bool:
+    """Whether ffmpeg can actually decode video frames from this file.
+    Catches e.g. animated WebP (often saved with a .gif extension), which
+    ffmpeg's native decoder rejects with "image data not found"."""
+    cmd = [_ffmpeg(), "-v", "error", "-nostdin", "-i", path,
+           "-frames:v", "1", "-f", "null", "-"]
+    try:
+        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=20).returncode == 0
+    except Exception:
+        return False
+
+
+def _transcode_animation_pil(path: str, out_path: str, max_seconds: float = 120.0) -> bool:
+    """Re-encodes an animated image (WebP/GIF/APNG...) to H.264 using
+    Pillow as the decoder, streaming frame-by-frame into ffmpeg. Honors
+    per-frame delays by resampling to a fixed 30fps."""
+    from PIL import Image, ImageSequence
+
+    try:
+        im = Image.open(path)
+    except Exception:
+        return False
+    if not getattr(im, "is_animated", False):
+        return False
+
+    fps = 30
+    frame_ms = 1000.0 / fps
+    width = im.width - (im.width % 2)  # yuv420p needs even dimensions
+    height = im.height - (im.height % 2)
+    tmp = out_path + ".part"
+    cmd = [
+        _ffmpeg(), "-y", "-v", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+        "-f", "mp4", tmp,  # explicit: the .part suffix hides the container
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        emitted_ms = 0.0
+        elapsed_ms = 0.0
+        for frame in ImageSequence.Iterator(im):
+            # Frames without a stored delay (many web WebPs) get a sane one.
+            duration = frame.info.get("duration") or 100
+            elapsed_ms += max(10, duration)
+            rgb = frame.convert("RGB")
+            if (rgb.width, rgb.height) != (width, height):
+                rgb = rgb.crop((0, 0, width, height))
+            data = rgb.tobytes()
+            while emitted_ms < elapsed_ms and emitted_ms < max_seconds * 1000:
+                proc.stdin.write(data)
+                emitted_ms += frame_ms
+            if emitted_ms >= max_seconds * 1000:
+                break
+        proc.stdin.close()
+        if proc.wait(timeout=120) != 0 or emitted_ms == 0:
+            raise RuntimeError("transcode failed")
+    except Exception:
+        proc.kill()
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    os.replace(tmp, out_path)
+    return True
+
+
+def is_animated_image(path: str) -> bool:
+    """Whether a file Pillow can open is a multi-frame animation (animated
+    WebP/PNG picked as a background "image" should play, not freeze)."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return bool(getattr(im, "is_animated", False))
+    except Exception:
+        return False
+
+
+def prepare_background_video(path: str) -> str | None:
+    """A path ffmpeg can stream for this background: the file itself when
+    its format decodes normally, otherwise a cached H.264 transcode made
+    with Pillow (animated WebP disguised as .gif is the typical case).
+    Returns None when nothing can decode the file."""
+    if _probe_decodable(path):
+        return path
+    import hashlib
+
+    try:
+        stamp = f"{path}|{os.path.getmtime(path)}|{os.path.getsize(path)}"
+    except OSError:
+        return None
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    cache = os.path.join(base, "rhr2mp4", "backgrounds")
+    os.makedirs(cache, exist_ok=True)
+    out = os.path.join(cache, hashlib.sha1(stamp.encode()).hexdigest()[:16] + ".mp4")
+    if os.path.isfile(out) and os.path.getsize(out) > 0:
+        return out
+    return out if _transcode_animation_pil(path, out) else None
+
+
 ProgressCallback = Callable[[int, int], None]
 
 # Quality presets trade encode speed for file size/quality ("fast" /
@@ -230,6 +359,74 @@ def default_worker_count() -> int:
     return max(1, min(n, 6))
 
 
+class _BgVideoReader:
+    """Streams a background video's (or animated GIF's) frames to
+    draw_frame, one per output frame. Each segment worker owns one reader:
+    its ffmpeg is seeked to the segment's wall-clock start and read strictly
+    forward (frames are fed in order; sub-frame blur samples re-use the
+    current frame). `-stream_loop -1` repeats sources shorter than the
+    render indefinitely (verified for mp4 and gif: after the seeked first
+    pass, playback wraps to the file's beginning)."""
+
+    def __init__(self, path: str, width: int, height: int, fps: int,
+                 first_ms: float, clip_start_ms: float, speed: float, brightness: float):
+        self.width, self.height = width, height
+        self.frame_size = width * height * 3
+        self.first_ms = first_ms
+        self.speed = speed if speed > 0 else 1.0
+        self.fps = fps
+        self.brightness = brightness
+        self.index = -1
+        self.current = None
+        start_wall_s = max(0.0, (first_ms - clip_start_ms) / self.speed / 1000.0)
+        # Seeking past the file's end works on a looped stream but decodes
+        # every loop up to the target; folding the offset into one loop
+        # lands on the same frame without that cost (matters for short
+        # backgrounds under segments that start minutes in).
+        duration_s = _probe_duration_s(path)
+        if duration_s > 0:
+            start_wall_s %= duration_s
+        vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+              f"crop={width}:{height},fps={fps}")
+        cmd = [
+            _ffmpeg(), "-stream_loop", "-1", "-ss", f"{start_wall_s:.3f}", "-i", path,
+            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1",
+        ]
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def _read_frame(self) -> bytes:
+        # Guard against a source that never yields frames (a broken input
+        # looped by -stream_loop would otherwise block this read forever).
+        if os.name != "nt":
+            import select
+            ready, _, _ = select.select([self.proc.stdout], [], [], 15.0)
+            if not ready:
+                return b""
+        return self.proc.stdout.read(self.frame_size)
+
+    def __call__(self, t_ms: float):
+        from .frame import apply_brightness
+        from PIL import Image
+
+        idx = max(0, round((t_ms - self.first_ms) / self.speed / 1000.0 * self.fps))
+        while self.index < idx:
+            data = self._read_frame()
+            if not data or len(data) < self.frame_size:
+                break  # source exhausted; keep showing the last frame
+            self.index += 1
+            self.current = apply_brightness(
+                Image.frombytes("RGB", (self.width, self.height), data), self.brightness)
+        return self.current
+
+    def close(self):
+        try:
+            self.proc.stdout.close()
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            pass
+
+
 def _render_segment(
     segment_index: int,
     frame_times: list[float],
@@ -263,6 +460,11 @@ def _render_segment(
     motion_blur_mode: str,
     warmup_frames: int,
     frame_dt_ms: float,
+    background_image_bytes: bytes | None,
+    background_video: str | None,
+    background_brightness: float,
+    clip_start_ms: float,
+    element_offsets: dict | None,
 ):
     # Imported inside the worker so a 'spawn'ed process only pays for these
     # (and builds its GL-free Pillow context) once, not at pool-creation time.
@@ -273,7 +475,10 @@ def _render_segment(
                                     background_dots_enabled, trail_scale,
                                     hit_effects_enabled, note_colors, color_overrides,
                                     hud_overrides)
-    ctx = build_context(width, height, cover_bytes, runtime_skin, playfield_extent=playfield_extent)
+    ctx = build_context(width, height, cover_bytes, runtime_skin, playfield_extent=playfield_extent,
+                        background_image_bytes=background_image_bytes,
+                        background_brightness=background_brightness,
+                        element_offsets=element_offsets)
     ctx.mods_label = mods_label
     timeline = Timeline(notes, results, replay, spawn_distance=spawn_distance, approach_rate=approach_rate,
                         ghost=ghost, chaos=chaos)
@@ -297,6 +502,15 @@ def _render_segment(
     warmup_times = [max(0.0, frame_times[0] - j * frame_dt_ms) for j in range(warmup_frames, 0, -1)]
     subframe_blur = motion_blur if motion_blur > 0 and motion_blur_mode == "subframe" else 0.0
 
+    bg_reader = None
+    if background_video:
+        all_times = warmup_times + frame_times
+        speed = replay.speed if replay.speed and replay.speed > 0 else 1.0
+        bg_reader = _BgVideoReader(background_video, width, height, fps,
+                                   first_ms=all_times[0], clip_start_ms=clip_start_ms,
+                                   speed=speed, brightness=background_brightness)
+        ctx.background_provider = bg_reader
+
     try:
         for i, t in enumerate(warmup_times + frame_times):
             if subframe_blur > 0:
@@ -308,6 +522,8 @@ def _render_segment(
             if done > 0 and done % PROGRESS_REPORT_EVERY == 0:
                 progress_queue.put((segment_index, done))
     finally:
+        if bg_reader is not None:
+            bg_reader.close()
         try:
             proc.stdin.close()
         except BrokenPipeError:
@@ -330,6 +546,8 @@ def _render_intro(
     trail_scale: float, hit_effects_enabled: bool, hud_overrides: dict | None,
     note_colors, color_overrides, playfield_extent: float,
     cancel_cb,
+    background_image: bytes | None = None,
+    background_brightness: float = 0.4,
 ) -> int:
     """Encodes the 2.5s intro card as its own segment file (placed first in
     the concat list). Runs in the main process -- it's only ~fps*2.5 frames
@@ -343,7 +561,8 @@ def _render_intro(
                                     background_dots_enabled, trail_scale,
                                     hit_effects_enabled, note_colors, color_overrides,
                                     hud_overrides)
-    ctx = build_context(width, height, map_.cover_bytes, runtime_skin, playfield_extent=playfield_extent)
+    ctx = build_context(width, height, map_.cover_bytes, runtime_skin, playfield_extent=playfield_extent,
+                        background_image_bytes=background_image, background_brightness=background_brightness)
     card = np.asarray(draw_intro_card(ctx, map_.metadata, replay, map_.cover_bytes), dtype=np.float32)
 
     n_frames = max(1, int(INTRO_DURATION_S * fps))
@@ -426,6 +645,10 @@ def render_video(
     music_volume: float = 100.0,  # % applied to the map audio (100 = unchanged)
     hit_sound_volume: float = 100.0,  # % on top of the skin's own HitSoundVolume
     hud_overrides: dict | None = None,  # RuntimeSkin flag name -> bool (hide/show HUD elements)
+    background_image: bytes | None = None,  # custom background image (raw file bytes)
+    background_video: str | None = None,  # custom background video path (loops; wins over image)
+    background_brightness: float = 0.4,  # brightness factor for custom backgrounds (1.0 = original, <1 darker, >1 brighter)
+    element_offsets: dict | None = None,  # HUD element name -> (dx, dy) canvas fractions (see frame.MOVABLE_ELEMENTS)
     progress_cb: ProgressCallback | None = None,
     cancel_cb: Callable[[], bool] | None = None,
 ) -> None:
@@ -436,6 +659,13 @@ def render_video(
         raise ValueError(f"unknown quality preset {quality!r}, choose one of {list(PRESETS)}")
     if video_codec not in ("h264", "hevc", "av1"):
         raise ValueError(f"unknown video codec {video_codec!r}")
+
+    if background_video:
+        prepared = prepare_background_video(background_video)
+        if prepared is None:
+            raise RuntimeError(
+                f"the background video/gif can't be decoded: {os.path.basename(background_video)}")
+        background_video = prepared
 
     hw, encoder_name = resolve_encoder(video_codec, hw_accel)
     _, enc_global, enc_vf, enc_quality = ENCODERS[(video_codec, hw)]
@@ -571,6 +801,7 @@ def render_video(
                 map_, replay, skin, parallax_enabled, trail_enabled,
                 background_dots_enabled, trail_scale, hit_effects_enabled, hud_overrides,
                 note_colors, color_overrides, playfield_extent, cancel_cb,
+                background_image=background_image, background_brightness=background_brightness,
             )
             if intro_frames < 0:
                 return  # cancelled during the intro
@@ -601,6 +832,8 @@ def render_video(
                     trail_enabled, color_overrides,
                     background_dots_enabled, trail_scale, hit_effects_enabled, hud_overrides,
                     motion_blur, motion_blur_mode, warmup_frames, frame_dt_ms,
+                    background_image, background_video, background_brightness, start_ms,
+                    element_offsets,
                 ),
             )
             for i, seg in enumerate(segments)
@@ -661,43 +894,64 @@ def render_video(
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed:\n{proc.stderr.decode(errors='replace')}")
 
-        if not audio_bytes:
-            # Maps can legitimately ship without audio -- output video-only.
+        # The output container decides the final pass. The internal pipeline
+        # always produces h264 segments (they concat with -c copy and every
+        # encoder path emits them); .mp4 muxes those untouched, while .webm
+        # and .gif re-encode this one already-composited stream -- much
+        # cheaper than teaching every segment worker a second codec.
+        container = os.path.splitext(output_path)[1].lower().lstrip(".") or "mp4"
+
+        afilters = []
+        if abs(speed - 1.0) > 1e-3:
+            # Speed the audio up/down the way the game's speed modifier
+            # does: resampling (pitch shifts along with tempo), not a
+            # pitch-preserving atempo stretch. Normalize to 48kHz first
+            # so the asetrate factor is exact regardless of the source's
+            # rate.
+            afilters.append(f"aresample=48000,asetrate=48000*{speed},aresample=48000")
+        if intro_frames > 0:
+            # Silence under the intro card; delay applied after the speed
+            # change so it's exact in output (wall) time.
+            afilters.append(f"adelay={int(intro_frames / fps * 1000)}:all=1")
+        # Clip: seek the audio to the clip start. Song time maps 1:1 to the
+        # original audio's own timeline (the speed modifier is applied via
+        # asetrate), so no speed division here.
+        audio_in = []
+        if audio_bytes and container != "gif":
+            audio_seek = ["-ss", f"{start_ms / 1000.0:.3f}"] if start_ms > 0 else []
+            audio_in = [*audio_seek, "-i", audio_path]
+
+        if container == "gif":
+            # Two-pass palette in one filter graph; GIFs cap at ~30fps in
+            # practice (browsers clamp faster delays), so limit the rate.
+            gif_fps = min(30, fps)
             mux_cmd = [
                 _ffmpeg(), "-y", "-i", video_only_path,
-                "-c:v", "copy", "-movflags", "+faststart", output_path,
+                "-filter_complex",
+                f"[0:v]fps={gif_fps},split[a][b];[a]palettegen=stats_mode=diff[p];"
+                f"[b][p]paletteuse=dither=bayer:bayer_scale=4",
+                "-loop", "0", output_path,
             ]
-        else:
-            # Clip: seek the audio to the clip start. Song time maps 1:1 to
-            # the original audio's own timeline (the speed modifier is
-            # applied below via asetrate), so no speed division here.
-            audio_seek = ["-ss", f"{start_ms / 1000.0:.3f}"] if start_ms > 0 else []
+        elif container == "webm":
+            crf = {"fast": "36", "balanced": "32", "quality": "28"}[quality]
+            cpu = {"fast": "5", "balanced": "3", "quality": "1"}[quality]
             mux_cmd = [
-                _ffmpeg(), "-y",
-                "-i", video_only_path,
-                *audio_seek, "-i", audio_path,
-                "-c:v", "copy",
+                _ffmpeg(), "-y", "-i", video_only_path, *audio_in,
+                "-c:v", "libvpx-vp9", "-crf", crf, "-b:v", "0",
+                "-row-mt", "1", "-cpu-used", cpu,
             ]
-            afilters = []
-            if abs(speed - 1.0) > 1e-3:
-                # Speed the audio up/down the way the game's speed modifier
-                # does: resampling (pitch shifts along with tempo), not a
-                # pitch-preserving atempo stretch. Normalize to 48kHz first
-                # so the asetrate factor is exact regardless of the source's
-                # rate.
-                afilters.append(f"aresample=48000,asetrate=48000*{speed},aresample=48000")
-            if intro_frames > 0:
-                # Silence under the intro card; delay applied after the speed
-                # change so it's exact in output (wall) time.
-                afilters.append(f"adelay={int(intro_frames / fps * 1000)}:all=1")
-            if afilters:
-                mux_cmd += ["-filter:a", ",".join(afilters)]
-            mux_cmd += [
-                "-c:a", "aac", "-b:a", audio_bitrate,
-                "-shortest",
-                "-movflags", "+faststart",
-                output_path,
-            ]
+            if audio_in:
+                if afilters:
+                    mux_cmd += ["-filter:a", ",".join(afilters)]
+                mux_cmd += ["-c:a", "libopus", "-b:a", audio_bitrate, "-shortest"]
+            mux_cmd += [output_path]
+        else:
+            mux_cmd = [_ffmpeg(), "-y", "-i", video_only_path, *audio_in, "-c:v", "copy"]
+            if audio_in:
+                if afilters:
+                    mux_cmd += ["-filter:a", ",".join(afilters)]
+                mux_cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-shortest"]
+            mux_cmd += ["-movflags", "+faststart", output_path]
         proc = subprocess.run(mux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg mux failed:\n{proc.stderr.decode(errors='replace')}")

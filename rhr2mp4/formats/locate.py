@@ -11,13 +11,28 @@ import os
 import re
 import zipfile
 
+from . import sspm
+
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+def _candidate_meta(path: str, ext: str) -> tuple[str, int, str, int]:
+    """(legacy_id, online_id, song/title name, note count) for a map file."""
+    if ext == ".sspm":
+        m = sspm.read_meta(path)
+        return (m.metadata.legacy_id, m.metadata.online_id,
+                m.metadata.song_name or m.metadata.title, len(m.notes))
+    with zipfile.ZipFile(path) as zf:
+        doc = json.loads(zf.read("map"))
+    return (doc.get("LegacyId") or "", doc.get("OnlineId") or 0,
+            doc.get("SongName") or doc.get("Title") or "", len(doc.get("Notes", [])))
+
+
 def find_map_for_replay(replay, search_dirs: list[str], replay_filename: str = "") -> str | None:
-    """Looks for the .rhm this replay was played on in `search_dirs`.
+    """Looks for the map (.rhm or .sspm) this replay was played on in
+    `search_dirs`.
 
     Exact LegacyId / OnlineId matches win (read straight from each
     candidate's zip, so it stays fast even in folders with many maps), but
@@ -43,23 +58,23 @@ def find_map_for_replay(replay, search_dirs: list[str], replay_filename: str = "
             continue
         seen.add(folder)
         for name in sorted(os.listdir(folder)):
-            if not name.lower().endswith(".rhm"):
+            ext = os.path.splitext(name)[1].lower()
+            if ext not in (".rhm", ".sspm"):
                 continue
             path = os.path.join(folder, name)
             try:
-                with zipfile.ZipFile(path) as zf:
-                    doc = json.loads(zf.read("map"))
+                legacy_id, online_id, song_name, map_notes = _candidate_meta(path, ext)
             except Exception:
                 continue
-            if (replay.map_legacy_id and doc.get("LegacyId") == replay.map_legacy_id) or (
-                replay.map_online_id and doc.get("OnlineId") == replay.map_online_id
+            if (replay.map_legacy_id and legacy_id == replay.map_legacy_id) or (
+                replay.map_online_id and online_id == replay.map_online_id
             ):
                 return path
             if name_candidate is None:
-                song_key = _norm(doc.get("SongName") or doc.get("Title") or "")
+                song_key = _norm(song_name)
                 if song_key and (song_key in replay_key or (filename_key and song_key in filename_key)):
                     name_candidate = path
-            if count_candidate is None and note_count > 0 and len(doc.get("Notes", [])) == note_count:
+            if count_candidate is None and note_count > 0 and map_notes == note_count:
                 count_candidate = path
     return name_candidate or count_candidate
 

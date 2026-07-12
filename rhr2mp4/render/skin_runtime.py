@@ -142,6 +142,10 @@ class RuntimeSkin:
     health_bar_enabled: bool = True
     # The speed/mods label under the health bar ("S++++  HR GH").
     speed_text_enabled: bool = True
+    # Hit-error (timing) bar under the playfield: ticks for recent hits by
+    # how early/late they were. An app render option, not a game HUD element,
+    # so it defaults off.
+    hit_error_bar_enabled: bool = False
     health_bar_color: tuple[int, int, int] = (211, 255, 151)  # game default light green
     health_bar_alpha: float = 1.0
     fail_vignette_opacity: float = 0.0
