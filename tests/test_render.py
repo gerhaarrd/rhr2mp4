@@ -97,5 +97,52 @@ class TestElementOffsets(unittest.TestCase):
         self.assertGreater(plain[top_strip].mean(), moved[top_strip].mean())
 
 
+@unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg on PATH")
+class TestSegmentEncoderFallback(unittest.TestCase):
+    """A hardware encoder that probes fine can still fail once every worker
+    opens a session at the same time; the segment worker must retry with the
+    software fallback and surface ffmpeg's stderr when everything fails."""
+
+    def _run_segment(self, encode_args):
+        from rhr2mp4.formats.rhm import MapMetadata
+        from rhr2mp4.formats.rhr import Frame
+        from rhr2mp4.render import video as V
+        from test_sim import make_replay
+
+        replay = make_replay([Frame(ms=0, x=0, y=0, health=1.0, important=False),
+                              Frame(ms=500, x=1, y=1, health=1.0, important=False)])
+        meta = MapMetadata(0, "", "", "Song", [], "Song", 500, 0, "", 0.0)
+        seg_path = tempfile.mktemp(suffix=".mp4")
+        self.addCleanup(lambda: os.path.exists(seg_path) and os.unlink(seg_path))
+
+        class Queue:
+            def put(self, item):
+                pass
+
+        V._render_segment(
+            0, [0.0, 100.0, 200.0], 128, 128, 30, encode_args,
+            None, [], [], replay, meta, seg_path, Queue(),
+            1.0, 1.0, None, True, None, False, False, 1.0, "",
+            True, None, True, 1.0, True, None,
+            0.0, "filter", 0, 100.0 / 3, None, None, 0.4, 0.0, None,
+        )
+        return seg_path
+
+    def test_broken_encoder_falls_back_to_software(self):
+        from rhr2mp4.render.video import _build_encode_args
+        good, _ = _build_encode_args("h264", "none", "fast", 0.0, "filter")
+        broken = dict(good, encoder="nonexistent_encoder", fallback=good)
+        seg = self._run_segment(broken)
+        self.assertGreater(os.path.getsize(seg), 0)
+
+    def test_failure_surfaces_ffmpeg_stderr(self):
+        from rhr2mp4.render.video import _build_encode_args
+        good, _ = _build_encode_args("h264", "none", "fast", 0.0, "filter")
+        broken = dict(good, encoder="nonexistent_encoder")
+        with self.assertRaises(RuntimeError) as cm:
+            self._run_segment(broken)
+        self.assertIn("nonexistent_encoder", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

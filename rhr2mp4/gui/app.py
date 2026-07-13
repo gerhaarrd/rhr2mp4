@@ -2810,9 +2810,10 @@ class MainWindow(QWidget):
         from ..paths import ffmpeg_exe
         try:
             out = subprocess.run(
-                [ffmpeg_exe() or "ffmpeg", "-v", "error", "-i", bg_video,
+                [ffmpeg_exe() or "ffmpeg", "-v", "error", "-nostdin", "-i", bg_video,
                  "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=15,
             ).stdout or None
         except Exception:
             out = None

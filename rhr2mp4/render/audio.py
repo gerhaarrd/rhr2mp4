@@ -31,7 +31,7 @@ def _decode_to_pcm(data: bytes, ext_hint: str) -> np.ndarray:
             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
             "pipe:1",
         ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg decode failed:\n{proc.stderr.decode(errors='replace')}")
 
@@ -93,7 +93,7 @@ def extract_music_snippet(
             cmd += ["-filter:a", ",".join(f"atempo={f:.6f}" for f in factors)]
         cmd += ["-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), "-f", "wav", "pipe:1"]
 
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg snippet failed:\n{proc.stderr.decode(errors='replace')}")
         return proc.stdout

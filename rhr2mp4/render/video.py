@@ -38,6 +38,13 @@ def _ffmpeg() -> str:
     return ffmpeg_exe() or "ffmpeg"
 
 
+# Encoder invocations keep stderr=PIPE to report failures, but that pipe is
+# only drained after the last frame is written -- ffmpeg's banner + per-frame
+# stats would eventually fill the (small, esp. on Windows) pipe buffer and
+# deadlock the encode. Log errors only.
+_QUIET = ("-hide_banner", "-nostats", "-loglevel", "error")
+
+
 def _probe_duration_s(path: str) -> float:
     """Media duration in seconds via ffprobe (looked up next to the ffmpeg
     in use, then on PATH); 0.0 when it can't be determined."""
@@ -53,7 +60,8 @@ def _probe_duration_s(path: str) -> float:
         out = subprocess.run(
             [probe, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=15,
         ).stdout.decode().strip()
         return max(0.0, float(out))
     except Exception:
@@ -66,7 +74,8 @@ def _probe_decodable(path: str) -> bool:
     cmd = [_ffmpeg(), "-v", "error", "-nostdin", "-i", path,
            "-frames:v", "1", "-f", "null", "-"]
     try:
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                               timeout=20).returncode == 0
     except Exception:
         return False
@@ -261,7 +270,8 @@ def _probe_encoder(codec: str, hw: str) -> bool:
         "-frames:v", "3", "-f", "null", "-",
     ]
     try:
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15).returncode == 0
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=15).returncode == 0
     except Exception:
         return False
 
@@ -389,10 +399,14 @@ class _BgVideoReader:
         vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
               f"crop={width}:{height},fps={fps}")
         cmd = [
-            _ffmpeg(), "-stream_loop", "-1", "-ss", f"{start_wall_s:.3f}", "-i", path,
+            _ffmpeg(), "-nostdin", "-stream_loop", "-1", "-ss", f"{start_wall_s:.3f}", "-i", path,
             "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "-an", "pipe:1",
         ]
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # stdin must be redirected explicitly: in the windowed (console=False)
+        # Windows build the process has no valid std handles, and leaving one
+        # unredirected hands the child an invalid handle.
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def _read_frame(self) -> bytes:
         # Guard against a source that never yields frames (a broken input
@@ -475,24 +489,6 @@ def _render_segment(
                                     background_dots_enabled, trail_scale,
                                     hit_effects_enabled, note_colors, color_overrides,
                                     hud_overrides)
-    ctx = build_context(width, height, cover_bytes, runtime_skin, playfield_extent=playfield_extent,
-                        background_image_bytes=background_image_bytes,
-                        background_brightness=background_brightness,
-                        element_offsets=element_offsets)
-    ctx.mods_label = mods_label
-    timeline = Timeline(notes, results, replay, spawn_distance=spawn_distance, approach_rate=approach_rate,
-                        ghost=ghost, chaos=chaos)
-
-    cmd = [
-        _ffmpeg(), "-y", *encode_args["global"],
-        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
-        "-i", "pipe:0",
-        *encode_args["vf"],
-        "-c:v", encode_args["encoder"], *encode_args["codec"],
-        *encode_args["tail"],
-        segment_path,
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     # Motion blur (tmix in the ffmpeg command) mixes each output frame with
     # the previous ones, so a segment's first frames would be less blurred
@@ -502,39 +498,82 @@ def _render_segment(
     warmup_times = [max(0.0, frame_times[0] - j * frame_dt_ms) for j in range(warmup_frames, 0, -1)]
     subframe_blur = motion_blur if motion_blur > 0 and motion_blur_mode == "subframe" else 0.0
 
-    bg_reader = None
-    if background_video:
-        all_times = warmup_times + frame_times
-        speed = replay.speed if replay.speed and replay.speed > 0 else 1.0
-        bg_reader = _BgVideoReader(background_video, width, height, fps,
-                                   first_ms=all_times[0], clip_start_ms=clip_start_ms,
-                                   speed=speed, brightness=background_brightness)
-        ctx.background_provider = bg_reader
+    def _encode(args: dict) -> tuple[int, str]:
+        """One full render+encode pass of this segment with one encoder
+        configuration. Returns (ffmpeg exit code, its stderr text)."""
+        ctx = build_context(width, height, cover_bytes, runtime_skin, playfield_extent=playfield_extent,
+                            background_image_bytes=background_image_bytes,
+                            background_brightness=background_brightness,
+                            element_offsets=element_offsets)
+        ctx.mods_label = mods_label
+        timeline = Timeline(notes, results, replay, spawn_distance=spawn_distance,
+                            approach_rate=approach_rate, ghost=ghost, chaos=chaos)
 
-    try:
-        for i, t in enumerate(warmup_times + frame_times):
-            if subframe_blur > 0:
-                img = draw_frame_blurred(ctx, timeline, map_meta, replay, t, frame_dt_ms, subframe_blur)
-            else:
-                img = draw_frame(ctx, timeline.state_at(t), map_meta, replay)
-            proc.stdin.write(img.tobytes())
-            done = i + 1 - len(warmup_times)
-            if done > 0 and done % PROGRESS_REPORT_EVERY == 0:
-                progress_queue.put((segment_index, done))
-    finally:
-        if bg_reader is not None:
-            bg_reader.close()
+        cmd = [
+            _ffmpeg(), "-y", *_QUIET, *args["global"],
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
+            "-i", "pipe:0",
+            *args["vf"],
+            "-c:v", args["encoder"], *args["codec"],
+            *args["tail"],
+            segment_path,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        bg_reader = None
+        if background_video:
+            all_times = warmup_times + frame_times
+            speed = replay.speed if replay.speed and replay.speed > 0 else 1.0
+            bg_reader = _BgVideoReader(background_video, width, height, fps,
+                                       first_ms=all_times[0], clip_start_ms=clip_start_ms,
+                                       speed=speed, brightness=background_brightness)
+            ctx.background_provider = bg_reader
+
         try:
-            proc.stdin.close()
-        except BrokenPipeError:
-            pass
-        stderr = proc.stderr.read()
-        ret = proc.wait()
+            for i, t in enumerate(warmup_times + frame_times):
+                if subframe_blur > 0:
+                    img = draw_frame_blurred(ctx, timeline, map_meta, replay, t, frame_dt_ms, subframe_blur)
+                else:
+                    img = draw_frame(ctx, timeline.state_at(t), map_meta, replay)
+                try:
+                    proc.stdin.write(img.tobytes())
+                except OSError:
+                    # The encoder died (BrokenPipeError on POSIX, EINVAL on
+                    # Windows). Its stderr, read below, says why.
+                    break
+                done = i + 1 - len(warmup_times)
+                if done > 0 and done % PROGRESS_REPORT_EVERY == 0:
+                    progress_queue.put((segment_index, done))
+        finally:
+            if bg_reader is not None:
+                bg_reader.close()
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            stderr = proc.stderr.read()
+            ret = proc.wait()
+        return ret, stderr.decode(errors="replace").strip()
+
+    ret, err = _encode(encode_args)
+    fallback = encode_args.get("fallback")
+    if ret != 0 and fallback:
+        # Hardware encoders can pass the single-session probe yet fail once
+        # every worker opens a session at the same time (consumer NVIDIA
+        # GPUs cap concurrent NVENC sessions, for example). Redrawing the
+        # segment with the software encoder is slower but always works.
+        ret2, err2 = _encode(fallback)
+        if ret2 == 0:
+            ret = 0
+        else:
+            ret = ret2
+            err = (f"[{encode_args['encoder']}] {err}\n"
+                   f"[{fallback['encoder']} fallback] {err2}")
 
     progress_queue.put((segment_index, len(frame_times)))
 
     if ret != 0:
-        raise RuntimeError(f"segment {segment_index} ffmpeg failed (code {ret}):\n{stderr.decode(errors='replace')}")
+        raise RuntimeError(f"segment {segment_index} video encoding failed (code {ret}):\n{err}")
 
 
 def _render_intro(
@@ -570,7 +609,7 @@ def _render_intro(
     # trim would eat frames) -- encode with the encoder's own vf only.
     intro_args = {**encode_args, "vf": list(enc_vf)}
     cmd = [
-        _ffmpeg(), "-y", *intro_args["global"],
+        _ffmpeg(), "-y", *_QUIET, *intro_args["global"],
         "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
         "-i", "pipe:0",
         *intro_args["vf"],
@@ -586,11 +625,14 @@ def _render_intro(
                 cancelled = True
                 break
             brightness = intro_frame_brightness(i / n_frames)
-            proc.stdin.write((card * brightness).astype(np.uint8).tobytes())
+            try:
+                proc.stdin.write((card * brightness).astype(np.uint8).tobytes())
+            except OSError:
+                break  # encoder died; its stderr, read below, says why
     finally:
         try:
             proc.stdin.close()
-        except BrokenPipeError:
+        except OSError:
             pass
         stderr = proc.stderr.read()
         ret = proc.wait()
@@ -600,6 +642,53 @@ def _render_intro(
     if ret != 0:
         raise RuntimeError(f"intro ffmpeg failed (code {ret}):\n{stderr.decode(errors='replace')}")
     return n_frames
+
+
+def _build_encode_args(video_codec: str, hw: str, quality: str,
+                       motion_blur: float, motion_blur_mode: str) -> tuple[dict, int]:
+    """The per-segment ffmpeg encoder configuration for one (codec, hw)
+    pair, with the filter-mode motion-blur chain folded into its -vf.
+    Returns (encode_args, warmup_frames)."""
+    encoder_name, enc_global, enc_vf, enc_quality = ENCODERS[(video_codec, hw)]
+    tail = []
+    if hw == "none":
+        # Keep software encoders single-threaded: parallelism comes from the
+        # segment workers, and n_workers * n_threads oversubscribes the CPU.
+        tail += ["-threads", "1"]
+    if not enc_vf:
+        tail += ["-pix_fmt", "yuv420p"]
+    if video_codec == "hevc":
+        # hvc1 tag so the .mp4 plays in Apple/QuickTime players too.
+        tail += ["-tag:v", "hvc1"]
+
+    # Fast motion-blur mode: applied by ffmpeg itself (essentially free)
+    # instead of drawing sub-frames in Python (the "subframe" mode, which
+    # multiplies the real bottleneck, Pillow drawing): tmix blends each
+    # frame with the previous 3, weighted so the current frame dominates at
+    # low intensity and the blend approaches a uniform 4-frame average at
+    # 100%. The trim drops the per-segment warm-up frames (see
+    # _render_segment) so segment joins blur identically to mid-segment
+    # frames.
+    warmup_frames = 0
+    vf = list(enc_vf)
+    if motion_blur > 0 and motion_blur_mode == "filter":
+        d = max(0.05, min(1.0, motion_blur))
+        weights = " ".join(f"{d ** e:.4f}" for e in (3, 2, 1, 0))  # oldest -> newest
+        warmup_frames = 3
+        blur_chain = (
+            f"tmix=frames=4:weights='{weights}',"
+            f"trim=start_frame={warmup_frames},setpts=PTS-STARTPTS"
+        )
+        # Blur first, then any encoder-required format/hwupload conversion.
+        vf = ["-vf", f"{blur_chain},{enc_vf[1]}" if enc_vf else blur_chain]
+
+    return {
+        "encoder": encoder_name,
+        "global": list(enc_global),
+        "vf": vf,
+        "codec": list(enc_quality[quality]),
+        "tail": tail,
+    }, warmup_frames
 
 
 def _split_into_segments(frame_times: list[float], num_segments: int) -> list[list[float]]:
@@ -668,46 +757,15 @@ def render_video(
         background_video = prepared
 
     hw, encoder_name = resolve_encoder(video_codec, hw_accel)
-    _, enc_global, enc_vf, enc_quality = ENCODERS[(video_codec, hw)]
-    tail = []
-    if hw == "none":
-        # Keep software encoders single-threaded: parallelism comes from the
-        # segment workers, and n_workers * n_threads oversubscribes the CPU.
-        tail += ["-threads", "1"]
-    if not enc_vf:
-        tail += ["-pix_fmt", "yuv420p"]
-    if video_codec == "hevc":
-        # hvc1 tag so the .mp4 plays in Apple/QuickTime players too.
-        tail += ["-tag:v", "hvc1"]
-
-    # Fast motion-blur mode: applied by ffmpeg itself (essentially free)
-    # instead of drawing sub-frames in Python (the "subframe" mode, which
-    # multiplies the real bottleneck, Pillow drawing): tmix blends each
-    # frame with the previous 3, weighted so the current frame dominates at
-    # low intensity and the blend approaches a uniform 4-frame average at
-    # 100%. The trim drops the per-segment warm-up frames (see
-    # _render_segment) so segment joins blur identically to mid-segment
-    # frames.
-    warmup_frames = 0
-    vf = list(enc_vf)
-    if motion_blur > 0 and motion_blur_mode == "filter":
-        d = max(0.05, min(1.0, motion_blur))
-        weights = " ".join(f"{d ** e:.4f}" for e in (3, 2, 1, 0))  # oldest -> newest
-        warmup_frames = 3
-        blur_chain = (
-            f"tmix=frames=4:weights='{weights}',"
-            f"trim=start_frame={warmup_frames},setpts=PTS-STARTPTS"
-        )
-        # Blur first, then any encoder-required format/hwupload conversion.
-        vf = ["-vf", f"{blur_chain},{enc_vf[1]}" if enc_vf else blur_chain]
-
-    encode_args = {
-        "encoder": encoder_name,
-        "global": list(enc_global),
-        "vf": vf,
-        "codec": list(enc_quality[quality]),
-        "tail": tail,
-    }
+    enc_vf = ENCODERS[(video_codec, hw)][2]
+    encode_args, warmup_frames = _build_encode_args(video_codec, hw, quality,
+                                                    motion_blur, motion_blur_mode)
+    if hw != "none":
+        # Hardware encoders can pass the single-session probe yet fail with
+        # several concurrent worker sessions (see _render_segment); give the
+        # workers a software configuration to retry with.
+        encode_args["fallback"], _ = _build_encode_args(video_codec, "none", quality,
+                                                        motion_blur, motion_blur_mode)
 
     if approach_rate <= 0:
         raise ValueError("approach_rate must be > 0")
@@ -890,7 +948,8 @@ def render_video(
             _ffmpeg(), "-y", "-f", "concat", "-safe", "0",
             "-i", concat_list_path, "-c", "copy", video_only_path,
         ]
-        proc = subprocess.run(concat_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.run(concat_cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg concat failed:\n{proc.stderr.decode(errors='replace')}")
 
@@ -952,6 +1011,7 @@ def render_video(
                     mux_cmd += ["-filter:a", ",".join(afilters)]
                 mux_cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-shortest"]
             mux_cmd += ["-movflags", "+faststart", output_path]
-        proc = subprocess.run(mux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.run(mux_cmd, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if proc.returncode != 0:
             raise RuntimeError(f"ffmpeg mux failed:\n{proc.stderr.decode(errors='replace')}")

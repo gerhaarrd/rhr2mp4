@@ -47,6 +47,10 @@ jobs:
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
           $ffmpeg = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffmpeg.exe | Select-Object -First 1
           Copy-Item $ffmpeg.FullName packaging/dist-win/rhr2mp4/
+          # ffprobe rides along: _probe_duration_s uses it to fold looped
+          # background seeks into a single pass.
+          $ffprobe = Get-ChildItem ffmpeg_tmp -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          Copy-Item $ffprobe.FullName packaging/dist-win/rhr2mp4/
           Compress-Archive -Path packaging/dist-win/rhr2mp4 -DestinationPath packaging/dist-win/rhr2mp4-windows-x86_64.zip
       - uses: actions/upload-artifact@v4
         with:
