@@ -34,6 +34,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -50,13 +51,15 @@ from ..sim.timeline import DEFAULT_APPROACH_RATE, DEFAULT_SPAWN_DISTANCE
 from .styles import build_stylesheet
 
 RESOLUTIONS = {
-    "1920×1080 (60 fps)": (1920, 1080, 60),
-    "1280×720  (60 fps)": (1280, 720, 60),
-    "1920×1080 (30 fps)": (1920, 1080, 30),
-    "1280×720  (30 fps)": (1280, 720, 30),
-    "1080×1920 (60 fps) — vertical": (1080, 1920, 60),
-    "1080×1920 (30 fps) — vertical": (1080, 1920, 30),
-    "720×1280  (60 fps) — vertical": (720, 1280, 60),
+    # Horizontal (16:9) — YouTube, Twitter/X, Facebook.
+    "YouTube / Twitter / Facebook — 1080p (60 fps)": (1920, 1080, 60),
+    "YouTube / Twitter / Facebook — 1080p (30 fps)": (1920, 1080, 30),
+    "YouTube / Twitter / Facebook — 720p  (60 fps)": (1280, 720, 60),
+    "YouTube / Twitter / Facebook — 720p  (30 fps)": (1280, 720, 30),
+    # Vertical (9:16) — TikTok, Instagram Reels, YouTube Shorts.
+    "TikTok / Reels / Shorts — 1080p (60 fps)": (1080, 1920, 60),
+    "TikTok / Reels / Shorts — 1080p (30 fps)": (1080, 1920, 30),
+    "TikTok / Reels / Shorts — 720p  (60 fps)": (720, 1280, 60),
 }
 
 QUALITIES = {
@@ -111,10 +114,14 @@ HUD_ELEMENTS = [
     ("Health bar", "health_bar_enabled"),
     ("Speed label (S++++)", "speed_text_enabled"),
     ("Timing bar", "hit_error_bar_enabled"),
+    ("Live stats (UR)", "live_stats_enabled"),
+    ("Playfield border", "border_enabled"),
 ]
 
 # HUD flags that start unchecked (extras the game itself doesn't draw).
-HUD_DEFAULT_OFF = {"hit_error_bar_enabled"}
+HUD_DEFAULT_OFF = {"hit_error_bar_enabled", "live_stats_enabled"}
+
+PIP_CORNERS = ("bottom-right", "bottom-left", "top-right", "top-left")
 
 # Color presets: note colors cycle per note (like the game's colorsets);
 # cursor/trail/border are single colors. Users can save their own, and the
@@ -234,7 +241,8 @@ class RenderWorker(QThread):
                  hud_overrides: dict | None = None,
                  music_volume: float = 100.0, hit_sound_volume: float = 100.0,
                  background_image: bytes | None = None, background_video: str | None = None,
-                 background_brightness: float = 0.4, element_offsets: dict | None = None):
+                 background_brightness: float = 0.4, element_offsets: dict | None = None,
+                 extra: dict | None = None):
         super().__init__()
         self.replay = replay
         self.game_map = game_map
@@ -268,6 +276,9 @@ class RenderWorker(QThread):
         self.background_video = background_video
         self.background_brightness = background_brightness
         self.element_offsets = element_offsets
+        # Extra render_video kwargs (effects, ghost race, PiP, reverse...);
+        # kept as a dict so new options don't grow this signature further.
+        self.extra = extra or {}
         self._cancelled = False
 
     def cancel(self):
@@ -310,10 +321,71 @@ class RenderWorker(QThread):
                 element_offsets=self.element_offsets,
                 progress_cb=lambda done, total: self.progress.emit(done, total),
                 cancel_cb=lambda: self._cancelled,
+                **self.extra,
             )
 
             if self._cancelled:
                 self.failed.emit("Rendering canceled.")
+            else:
+                self.finished_ok.emit(self.output_path)
+        except Exception as e:
+            self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
+# ---------------------------------------------------------------------------
+# Montage (highlight reel) worker
+# ---------------------------------------------------------------------------
+
+class MontageWorker(QThread):
+    """Renders the auto-picked best moment of several replays and joins them
+    into one highlight reel with transitions (render.montage)."""
+
+    progress = pyqtSignal(int, int)
+    finished_ok = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, sources: list[tuple[str, str]], output_path: str,
+                 clip_ms: float, transition: str,
+                 width: int, height: int, fps: int, quality: str, video_codec: str,
+                 render_kwargs: dict):
+        super().__init__()
+        self.sources = sources  # (rhr_path, rhm_path) pairs
+        self.output_path = output_path
+        self.clip_ms = clip_ms
+        self.transition = transition
+        self.width, self.height, self.fps = width, height, fps
+        self.quality = quality
+        self.video_codec = video_codec
+        self.render_kwargs = render_kwargs
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        from ..render.montage import MontageItem, render_montage
+        from ..sim.highlight import find_highlight
+
+        try:
+            items = []
+            for rhr_path, rhm_path in self.sources:
+                replay = rhr.load(rhr_path)
+                game_map = maps.load(rhm_path)
+                start_ms, end_ms = find_highlight(
+                    [n.time_ms for n in game_map.notes], replay, duration_ms=self.clip_ms)
+                items.append(MontageItem(map_=game_map, replay=replay,
+                                         clip_start_ms=start_ms, clip_end_ms=end_ms))
+            render_montage(
+                items, self.output_path,
+                transition=self.transition,
+                width=self.width, height=self.height, fps=self.fps,
+                quality=self.quality, video_codec=self.video_codec,
+                progress_cb=lambda done, total: self.progress.emit(done, total),
+                cancel_cb=lambda: self._cancelled,
+                render_kwargs=self.render_kwargs,
+            )
+            if self._cancelled:
+                self.failed.emit("Montage canceled.")
             else:
                 self.finished_ok.emit(self.output_path)
         except Exception as e:
@@ -416,6 +488,7 @@ class PreviewAnimWorker(QThread):
                             ghost=ghost, chaos=chaos)
         ctx = build_context(o["w"], o["h"], self.game_map.cover_bytes, runtime,
                             playfield_extent=extent,
+                            playfield_scale=o.get("playfield_scale", 1.0),
                             background_image_bytes=o.get("bg_bytes"),
                             background_brightness=o.get("bg_brightness", 0.4),
                             element_offsets=o.get("element_offsets"))
@@ -479,14 +552,30 @@ class LayoutPreviewLabel(QLabel):
 
     layoutChanged = pyqtSignal(str)  # element being dragged (live)
     layoutCommitted = pyqtSignal()  # mouse released after a drag
+    hideRequested = pyqtSignal(str)  # right-click > Hide on an element
+    hideAssetRequested = pyqtSignal(str)  # right-click > Hide on a skin image
+    showAssetsRequested = pyqtSignal()  # right-click > Show hidden skin images
 
     # Hit-test order: smallest/most specific elements win.
-    _PRIORITY = ("timing", "combo", "health", "left_panel", "right_panel", "title")
+    _PRIORITY = ("timing", "stats", "versus", "combo", "health",
+                 "left_panel", "right_panel", "title")
+
+    # Friendly names for the right-click menu / status messages.
+    ELEMENT_LABELS = {
+        "title": "song title & time", "combo": "center combo",
+        "health": "health bar", "timing": "timing bar",
+        "left_panel": "left panel", "right_panel": "right panel",
+        "stats": "live stats", "versus": "versus panel",
+    }
 
     def __init__(self, text: str):
         super().__init__(text)
         self.offsets: dict[str, list[float]] = {}
         self.rects_provider = None  # callable -> dict[name, (fx, fy, fw, fh)] | None
+        # Same shape, but for the skin's decorative background images
+        # (right-click hide only -- they aren't draggable).
+        self.asset_rects_provider = None
+        self.hidden_assets_count = 0  # kept in sync by the main window
         self._drag_name: str | None = None
         self._drag_last: tuple[float, float] | None = None
         self.setMouseTracking(True)
@@ -558,6 +647,53 @@ class LayoutPreviewLabel(QLabel):
             self.layoutCommitted.emit()
             return
         super().mouseDoubleClickEvent(event)
+
+    def _hit_asset(self, frac: tuple[float, float]) -> str | None:
+        rects = self.asset_rects_provider() if self.asset_rects_provider else None
+        if not rects:
+            return None
+        fx, fy = frac
+        best, best_area = None, None  # layers can overlap: smallest box wins
+        for name, r in rects.items():
+            if r[0] <= fx <= r[0] + r[2] and r[1] <= fy <= r[1] + r[3]:
+                area = r[2] * r[3]
+                if best_area is None or area < best_area:
+                    best, best_area = name, area
+        return best
+
+    def contextMenuEvent(self, event):
+        # Right-click removes things from the video: HUD elements (the HUD
+        # ELEMENTS card brings them back) and the skin's decorative images.
+        frac = self._frac_pos(event.pos())
+        name = self._hit(frac) if frac else None
+        asset = self._hit_asset(frac) if frac and not name else None
+        if not name and not asset and not self.hidden_assets_count:
+            return super().contextMenuEvent(event)
+        menu = QMenu(self)
+        hide_action = reset_action = asset_action = show_assets_action = None
+        if name:
+            label = self.ELEMENT_LABELS.get(name, name.replace("_", " "))
+            hide_action = menu.addAction(f"Hide {label}")
+            if name in self.offsets:
+                reset_action = menu.addAction("Reset position")
+        elif asset:
+            asset_action = menu.addAction(f"Hide skin image {asset}")
+        if self.hidden_assets_count:
+            show_assets_action = menu.addAction(
+                f"Show {self.hidden_assets_count} hidden skin image(s)")
+        chosen = menu.exec_(event.globalPos())
+        if chosen is None:
+            return
+        if chosen is hide_action:
+            self.hideRequested.emit(name)
+        elif chosen is reset_action:
+            del self.offsets[name]
+            self.layoutChanged.emit(name)
+            self.layoutCommitted.emit()
+        elif chosen is asset_action:
+            self.hideAssetRequested.emit(asset)
+        elif chosen is show_assets_action:
+            self.showAssetsRequested.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -686,9 +822,13 @@ class CollapsibleCard(QFrame):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QWidget):
+    # Emitted from the webhook delivery thread; connected to the status
+    # label so UI updates stay on the GUI thread.
+    webhook_status = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
-        self.worker: RenderWorker | None = None
+        self.worker: RenderWorker | MontageWorker | None = None
         self._settings = QSettings("rhr2mp4", "rhr2mp4")
         self._colorset_note = ""
         self.rhr_path = ""
@@ -712,6 +852,10 @@ class MainWindow(QWidget):
         self._anim_timer.timeout.connect(self._anim_tick)
         self._tray = None
         self._last_output_path = ""
+        # Skin background images removed via right-click on the preview
+        # (layer names, see formats.rhs.BackgroundLayer.name); rides along
+        # in _hud_overrides() so renders/presets/QSettings all pick it up.
+        self.hidden_assets: set[str] = set()
         # Auto-load the preview shortly after both files are in (debounced:
         # loading a replay often sets the map right after via auto-detect).
         self._auto_preview_timer = QTimer(self)
@@ -725,6 +869,7 @@ class MainWindow(QWidget):
         self._watcher: QFileSystemWatcher | None = None
         self._watch_seen: set[str] = set()
         self.init_ui()
+        self.webhook_status.connect(self.status_label.setText)
 
     # ── UI construction ──────────────────────────────────────────────
 
@@ -816,6 +961,9 @@ class MainWindow(QWidget):
         par = s.value("parallax", None)
         if par is not None:
             self.parallax_check.setChecked(str(par).lower() == "true")
+        pf_scale = s.value("playfield_scale", None)
+        if pf_scale is not None:
+            self.playfield_scale_spin.setValue(float(pf_scale))
         # Cursor trail
         trail = s.value("cursor_trail", None)
         if trail is not None:
@@ -841,6 +989,8 @@ class MainWindow(QWidget):
         for flag, cb in self.hud_checks.items():
             if flag in hud:
                 cb.setChecked(bool(hud[flag]))
+        self.hidden_assets = {str(n) for n in (hud.get("hidden_layer_names") or [])}
+        self.preview_label.hidden_assets_count = len(self.hidden_assets)
         # Trail length
         tl = s.value("trail_length", None)
         if tl is not None:
@@ -893,6 +1043,27 @@ class MainWindow(QWidget):
             val = s.value(key, "", type=str)
             if val and combo.findText(val) >= 0:
                 combo.setCurrentText(val)
+        # Effects / PiP / webhook
+        for key, check in (("fx_dynamic_camera", self.fx_camera_check),
+                           ("fx_beat_pulse", self.fx_beat_check),
+                           ("fx_miss_particles", self.fx_particles_check),
+                           ("fx_spawn_particles", self.fx_spawn_particles_check),
+                           ("fx_note_anim", self.fx_spawn_check),
+                           ("fx_reverse", self.reverse_check)):
+            val = s.value(key, None)
+            if val is not None:
+                check.setChecked(str(val).lower() == "true")
+        for key, spin in (("beat_pulse_intensity", self.beat_pulse_spin),
+                          ("edge_blur", self.edge_blur_spin),
+                          ("pip_scale", self.pip_scale_spin)):
+            val = s.value(key, None)
+            if val is not None:
+                spin.setValue(float(val))
+        self.pip_path_edit.setText(s.value("pip_path", "", type=str))
+        corner = s.value("pip_corner", "", type=str)
+        if corner and self.pip_corner_combo.findText(corner) >= 0:
+            self.pip_corner_combo.setCurrentText(corner)
+        self.webhook_edit.setText(s.value("webhook_url", "", type=str))
 
     def _save_settings(self):
         s = self._settings
@@ -901,6 +1072,7 @@ class MainWindow(QWidget):
         s.setValue("spawn_distance", self.spawn_distance_spin.value())
         s.setValue("approach_rate", self.approach_rate_spin.value())
         s.setValue("parallax", self.parallax_check.isChecked())
+        s.setValue("playfield_scale", self.playfield_scale_spin.value())
         s.setValue("cursor_trail", self.trail_check.isChecked())
         s.setValue("background_dots", self.bg_dots_check.isChecked())
         s.setValue("hit_effects", self.hit_fx_check.isChecked())
@@ -921,6 +1093,18 @@ class MainWindow(QWidget):
         s.setValue("element_offsets", json.dumps(self.preview_label.offsets))
         s.setValue("watch_dir", self.watch_dir_edit.text().strip())
         s.setValue("watch_enabled", self.watch_check.isChecked())
+        s.setValue("fx_dynamic_camera", self.fx_camera_check.isChecked())
+        s.setValue("fx_beat_pulse", self.fx_beat_check.isChecked())
+        s.setValue("beat_pulse_intensity", self.beat_pulse_spin.value())
+        s.setValue("fx_miss_particles", self.fx_particles_check.isChecked())
+        s.setValue("fx_spawn_particles", self.fx_spawn_particles_check.isChecked())
+        s.setValue("fx_note_anim", self.fx_spawn_check.isChecked())
+        s.setValue("fx_reverse", self.reverse_check.isChecked())
+        s.setValue("edge_blur", self.edge_blur_spin.value())
+        s.setValue("pip_path", self.pip_path_edit.text().strip())
+        s.setValue("pip_corner", self.pip_corner_combo.currentText())
+        s.setValue("pip_scale", self.pip_scale_spin.value())
+        s.setValue("webhook_url", self.webhook_edit.text().strip())
         self._save_color_settings()
 
     def closeEvent(self, event):
@@ -1046,6 +1230,22 @@ class MainWindow(QWidget):
         header.addWidget(section)
         header.addStretch(1)
 
+        # Highlight reel from the queued replays: the best ~15s of each,
+        # joined with the chosen transition.
+        self.montage_transition_combo = QComboBox()
+        from ..render.montage import TRANSITIONS
+        self.montage_transition_combo.addItems(TRANSITIONS)
+        self._style_combobox(self.montage_transition_combo)
+        self.montage_transition_combo.setToolTip("Transition between montage clips.")
+        header.addWidget(self.montage_transition_combo)
+
+        montage_btn = QPushButton("🎬 Montage")
+        montage_btn.setObjectName("secondaryButton")
+        montage_btn.setToolTip("Render the best ~15s of the loaded replay and every queued one,\n"
+                               "joined into a single highlight reel with transitions.")
+        montage_btn.clicked.connect(self._start_montage)
+        header.addWidget(montage_btn)
+
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("secondaryButton")
         remove_btn.clicked.connect(self._remove_queue_item)
@@ -1070,6 +1270,11 @@ class MainWindow(QWidget):
         )
         layout.addWidget(self.queue_list)
 
+        self.queue_eta_label = QLabel("")
+        self.queue_eta_label.setObjectName("etaLabel")
+        self.queue_eta_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        layout.addWidget(self.queue_eta_label)
+
         self._queue_card.setVisible(False)
         return self._queue_card
 
@@ -1092,7 +1297,8 @@ class MainWindow(QWidget):
             self._preferred_output_dir(path),
             locate.default_output_name(map_name, replay.username, path),
         )
-        self.render_queue.append({"rhr": path, "rhm": rhm_path, "output": output})
+        self.render_queue.append({"rhr": path, "rhm": rhm_path, "output": output,
+                                  "length_ms": replay.length_ms})
         self._refresh_queue_ui()
 
     def _refresh_queue_ui(self):
@@ -1103,6 +1309,45 @@ class MainWindow(QWidget):
             entry = self.queue_list.item(self.queue_list.count() - 1)
             entry.setToolTip(f"{item['rhr']}\n→ {item['rhm'] or 'no map'}\n→ {item['output']}")
         self._queue_card.setVisible(bool(self.render_queue))
+        self._update_queue_eta()
+
+    def _estimate_seconds(self, total_frames: float, width: int, height: int) -> float | None:
+        """Scales the last measured preview-frame draw cost to a full render
+        of `total_frames` at `width`x`height`, divided across the render
+        workers -- the same rough model _show_render_estimate uses for the
+        single-render ETA, reused here for the queue total and montage
+        estimate so all three stay consistent."""
+        draw_s = getattr(self, "_last_draw_s", None)
+        preview_px = getattr(self, "_last_preview_px", None)
+        if not draw_s or not preview_px or total_frames <= 0:
+            return None
+        from ..render.video import default_worker_count
+        return draw_s * (width * height / preview_px) * total_frames / default_worker_count() * 1.15
+
+    def _update_queue_eta(self):
+        """Sums the rough per-item estimate (see _estimate_seconds) across
+        the queue, using each item's own replay length at the currently
+        selected resolution/fps (its own speed modifier isn't known until
+        it's loaded, so this assumes 1x -- rough, like the single estimate)."""
+        if not self.render_queue:
+            self.queue_eta_label.setText("")
+            return
+        width, height, fps = RESOLUTIONS[self.resolution_combo.currentText()]
+        total = 0.0
+        known = 0
+        for item in self.render_queue:
+            length_ms = item.get("length_ms")
+            if not length_ms:
+                continue
+            est = self._estimate_seconds(length_ms / 1000.0 * fps, width, height)
+            if est is not None:
+                total += est
+                known += 1
+        if known == 0:
+            self.queue_eta_label.setText("")
+            return
+        suffix = "" if known == len(self.render_queue) else f" ({known}/{len(self.render_queue)} estimated)"
+        self.queue_eta_label.setText(f"queue est. ~{_format_duration(total)}{suffix}")
 
     def _remove_queue_item(self):
         row = self.queue_list.currentRow()
@@ -1159,6 +1404,7 @@ class MainWindow(QWidget):
 
         layout.addWidget(self._make_output_card())
         layout.addWidget(self._make_settings_card())
+        layout.addWidget(self._make_effects_card())
         layout.addWidget(self._make_hud_card())
         layout.addWidget(self._make_extras_card())
         layout.addWidget(self._make_colors_card())
@@ -1262,6 +1508,17 @@ class MainWindow(QWidget):
         self.render_preset_delete_btn.setObjectName("secondaryButton")
         self.render_preset_delete_btn.clicked.connect(self._delete_render_preset)
         preset_row.addWidget(self.render_preset_delete_btn)
+        rp_export = QPushButton("Export…")
+        rp_export.setObjectName("secondaryButton")
+        rp_export.setToolTip("Export the current settings (plus the selected skin and\n"
+                             "colorset files) as a shareable .rhrp bundle.")
+        rp_export.clicked.connect(self._export_preset_bundle)
+        preset_row.addWidget(rp_export)
+        rp_import = QPushButton("Import…")
+        rp_import.setObjectName("secondaryButton")
+        rp_import.setToolTip("Import a .rhrp preset bundle someone shared with you.")
+        rp_import.clicked.connect(self._import_preset_bundle)
+        preset_row.addWidget(rp_import)
         vbox.addLayout(preset_row)
 
         grid_host = QWidget()
@@ -1271,31 +1528,19 @@ class MainWindow(QWidget):
         grid.setVerticalSpacing(14)
         vbox.addWidget(grid_host)
 
-        # Row 0
+        # ── Output ──────────────────────────────────────────────────────
+        grid.addWidget(self._subsection_label("Output"), 0, 0, 1, 2)
+
         self.resolution_combo = QComboBox()
         self.resolution_combo.addItems(RESOLUTIONS.keys())
         self._style_combobox(self.resolution_combo)
-        grid.addWidget(self._wrap_labeled("Resolution & FPS", self.resolution_combo), 0, 0)
+        grid.addWidget(self._wrap_labeled("Resolution & FPS", self.resolution_combo), 1, 0)
 
         self.quality_combo = QComboBox()
         self.quality_combo.addItems(QUALITIES.keys())
         self._style_combobox(self.quality_combo)
-        grid.addWidget(self._wrap_labeled("Render quality", self.quality_combo), 0, 1)
+        grid.addWidget(self._wrap_labeled("Render quality", self.quality_combo), 1, 1)
 
-        # Row 1
-        self.spawn_distance_spin = QDoubleSpinBox()
-        self.spawn_distance_spin.setRange(0.1, 100.0)
-        self.spawn_distance_spin.setSingleStep(0.1)
-        self.spawn_distance_spin.setValue(DEFAULT_SPAWN_DISTANCE)
-        grid.addWidget(self._wrap_labeled("Spawn distance", self.spawn_distance_spin), 1, 0)
-
-        self.approach_rate_spin = QDoubleSpinBox()
-        self.approach_rate_spin.setRange(0.1, 100.0)
-        self.approach_rate_spin.setSingleStep(0.1)
-        self.approach_rate_spin.setValue(DEFAULT_APPROACH_RATE)
-        grid.addWidget(self._wrap_labeled("Approach rate", self.approach_rate_spin), 1, 1)
-
-        # Row 2: export/encoding options
         self.codec_combo = QComboBox()
         self.codec_combo.addItems(CODECS.keys())
         self._style_combobox(self.codec_combo)
@@ -1316,16 +1561,6 @@ class MainWindow(QWidget):
         self.audio_combo.setCurrentText("192 kbps")
         self._style_combobox(self.audio_combo)
         grid.addWidget(self._wrap_labeled("Audio bitrate", self.audio_combo), 3, 0)
-
-        # Row 3-4: visual tweaks
-        self.trail_length_spin = QDoubleSpinBox()
-        self.trail_length_spin.setRange(10.0, 300.0)
-        self.trail_length_spin.setSingleStep(10.0)
-        self.trail_length_spin.setDecimals(0)
-        self.trail_length_spin.setSuffix(" %")
-        self.trail_length_spin.setValue(100.0)
-        self.trail_length_spin.setToolTip("Length of the cursor trail (100% = default; 50% = half as long).")
-        grid.addWidget(self._wrap_labeled("Trail length", self.trail_length_spin), 3, 1)
 
         self.motion_blur_combo = QComboBox()
         self.motion_blur_combo.addItems(MOTION_BLUR_MODES.keys())
@@ -1351,12 +1586,51 @@ class MainWindow(QWidget):
         blur_row.setSpacing(10)
         blur_row.addWidget(self.motion_blur_combo, 1)
         blur_row.addWidget(self.motion_blur_spin)
-        grid.addWidget(self._wrap_labeled("Motion blur", self._hbox_widget(blur_row)), 4, 0)
+        grid.addWidget(self._wrap_labeled("Motion blur", self._hbox_widget(blur_row)), 3, 1)
 
         self.intro_check = QCheckBox("Intro screen (2.5s cover + stats before gameplay)")
-        grid.addWidget(self._wrap_labeled("Intro", self.intro_check), 4, 1)
+        grid.addWidget(self._wrap_labeled("Intro", self.intro_check), 4, 0, 1, 2)
 
-        # Row 5: audio volumes (applied to the rendered video and the preview)
+        # ── Gameplay & camera ───────────────────────────────────────────
+        grid.addWidget(self._subsection_label("Gameplay & camera"), 5, 0, 1, 2)
+
+        self.spawn_distance_spin = QDoubleSpinBox()
+        self.spawn_distance_spin.setRange(0.1, 100.0)
+        self.spawn_distance_spin.setSingleStep(0.1)
+        self.spawn_distance_spin.setValue(DEFAULT_SPAWN_DISTANCE)
+        grid.addWidget(self._wrap_labeled("Spawn distance", self.spawn_distance_spin), 6, 0)
+
+        self.approach_rate_spin = QDoubleSpinBox()
+        self.approach_rate_spin.setRange(0.1, 100.0)
+        self.approach_rate_spin.setSingleStep(0.1)
+        self.approach_rate_spin.setValue(DEFAULT_APPROACH_RATE)
+        grid.addWidget(self._wrap_labeled("Approach rate", self.approach_rate_spin), 6, 1)
+
+        self.playfield_scale_spin = QDoubleSpinBox()
+        self.playfield_scale_spin.setRange(10.0, 100.0)
+        self.playfield_scale_spin.setSingleStep(5.0)
+        self.playfield_scale_spin.setDecimals(0)
+        self.playfield_scale_spin.setSuffix(" %")
+        self.playfield_scale_spin.setValue(100.0)
+        self.playfield_scale_spin.setToolTip(
+            "Shrinks the playfield square (and everything anchored to it --\n"
+            "panels, combo, health/timing bars) around its own center, opening\n"
+            "up breathing room around it. 100% = default size.")
+        grid.addWidget(self._wrap_labeled("Playfield size", self.playfield_scale_spin), 7, 0)
+        self.playfield_scale_spin.valueChanged.connect(self._schedule_auto_preview)
+
+        self.trail_length_spin = QDoubleSpinBox()
+        self.trail_length_spin.setRange(10.0, 300.0)
+        self.trail_length_spin.setSingleStep(10.0)
+        self.trail_length_spin.setDecimals(0)
+        self.trail_length_spin.setSuffix(" %")
+        self.trail_length_spin.setValue(100.0)
+        self.trail_length_spin.setToolTip("Length of the cursor trail (100% = default; 50% = half as long).")
+        grid.addWidget(self._wrap_labeled("Trail length", self.trail_length_spin), 7, 1)
+
+        # ── Audio levels ────────────────────────────────────────────────
+        grid.addWidget(self._subsection_label("Audio levels"), 8, 0, 1, 2)
+
         self.music_volume_spin = QDoubleSpinBox()
         self.music_volume_spin.setRange(0.0, 200.0)
         self.music_volume_spin.setSingleStep(10.0)
@@ -1364,7 +1638,7 @@ class MainWindow(QWidget):
         self.music_volume_spin.setSuffix(" %")
         self.music_volume_spin.setValue(100.0)
         self.music_volume_spin.setToolTip("Music volume in the video and preview (0% mutes the track).")
-        grid.addWidget(self._wrap_labeled("Music volume", self.music_volume_spin), 5, 0)
+        grid.addWidget(self._wrap_labeled("Music volume", self.music_volume_spin), 9, 0)
 
         self.hit_volume_spin = QDoubleSpinBox()
         self.hit_volume_spin.setRange(0.0, 200.0)
@@ -1376,13 +1650,15 @@ class MainWindow(QWidget):
             "Hit sound volume in the video and preview (0% disables it).\n"
             "Skins without their own hit sound use the app's default one."
         )
-        grid.addWidget(self._wrap_labeled("Hitsound volume", self.hit_volume_spin), 5, 1)
+        grid.addWidget(self._wrap_labeled("Hitsound volume", self.hit_volume_spin), 9, 1)
 
         # Re-run the animated preview so volume changes are heard right away.
         self.music_volume_spin.valueChanged.connect(self._schedule_auto_preview)
         self.hit_volume_spin.valueChanged.connect(self._schedule_auto_preview)
 
-        # Row 6: custom background (image, video or animated gif) + brightness
+        # ── Background ──────────────────────────────────────────────────
+        grid.addWidget(self._subsection_label("Background"), 10, 0, 1, 2)
+
         self.bg_path_edit = QLineEdit()
         self.bg_path_edit.setPlaceholderText("Optional background image, video or gif")
         self.bg_path_edit.setToolTip(
@@ -1402,7 +1678,7 @@ class MainWindow(QWidget):
         bg_row.addWidget(self.bg_path_edit, 1)
         bg_row.addWidget(bg_browse)
         bg_row.addWidget(bg_clear)
-        grid.addWidget(self._wrap_labeled("Background (image/video)", self._hbox_widget(bg_row)), 6, 0)
+        grid.addWidget(self._wrap_labeled("Background (image/video)", self._hbox_widget(bg_row)), 11, 0)
 
         self.bg_brightness_spin = QDoubleSpinBox()
         self.bg_brightness_spin.setRange(0.0, 200.0)
@@ -1413,13 +1689,117 @@ class MainWindow(QWidget):
         self.bg_brightness_spin.setToolTip(
             "Brightness of the custom background: 100% = untouched,\n"
             "lower darkens (keeps notes and HUD readable), higher brightens.")
-        grid.addWidget(self._wrap_labeled("Background brightness", self.bg_brightness_spin), 6, 1)
+        grid.addWidget(self._wrap_labeled("Background brightness", self.bg_brightness_spin), 11, 1)
 
         self.bg_path_edit.textChanged.connect(self._schedule_auto_preview)
         self.bg_brightness_spin.valueChanged.connect(self._schedule_auto_preview)
 
         card.set_body_widget(body)
         return card
+
+    def _make_effects_card(self) -> CollapsibleCard:
+        """Opt-in visual effects and the PiP overlay -- split out from RENDER
+        SETTINGS (which was becoming a dumping ground for every new toggle)
+        so each card stays scannable."""
+        card = CollapsibleCard("EFFECTS & OVERLAYS", expanded=False)
+
+        body = QWidget()
+        vbox = QVBoxLayout(body)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(14)
+
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(14)
+        vbox.addWidget(grid_host)
+
+        # All opt-in; applied to the video, the preview shows the plain frame.
+        self.fx_camera_check = QCheckBox("Dynamic camera")
+        self.fx_camera_check.setToolTip("Camera slowly zooms in as the combo builds and shakes on misses.")
+        self.fx_beat_check = QCheckBox("Beat pulse")
+        self.fx_beat_check.setToolTip("Background brightness pulses with the music's onsets.")
+        self.fx_particles_check = QCheckBox("Miss particles")
+        self.fx_particles_check.setToolTip("Particle burst flying out of missed notes.")
+        self.fx_spawn_particles_check = QCheckBox("Spawn particles")
+        self.fx_spawn_particles_check.setToolTip("Particle burst flying out of notes as they spawn.")
+        self.fx_spawn_check = QCheckBox("Note spawn pop")
+        self.fx_spawn_check.setToolTip("Notes pop/spin into place as they spawn.")
+        self.reverse_check = QCheckBox("Reverse")
+        self.reverse_check.setToolTip("Play the replay (and its audio) backwards.")
+        fx_row = QHBoxLayout()
+        fx_row.setSpacing(14)
+        for cb in (self.fx_camera_check, self.fx_beat_check, self.fx_particles_check,
+                   self.fx_spawn_particles_check, self.fx_spawn_check, self.reverse_check):
+            fx_row.addWidget(cb)
+        fx_row.addStretch(1)
+        grid.addWidget(self._wrap_labeled("Effects", self._hbox_widget(fx_row)), 0, 0, 1, 2)
+
+        self.beat_pulse_spin = QDoubleSpinBox()
+        self.beat_pulse_spin.setRange(10.0, 100.0)
+        self.beat_pulse_spin.setSingleStep(10.0)
+        self.beat_pulse_spin.setDecimals(0)
+        self.beat_pulse_spin.setSuffix(" %")
+        self.beat_pulse_spin.setValue(60.0)
+        self.beat_pulse_spin.setEnabled(False)
+        self.fx_beat_check.toggled.connect(self.beat_pulse_spin.setEnabled)
+        grid.addWidget(self._wrap_labeled("Beat pulse intensity", self.beat_pulse_spin), 1, 0)
+
+        self.edge_blur_spin = QDoubleSpinBox()
+        self.edge_blur_spin.setRange(0.0, 100.0)
+        self.edge_blur_spin.setSingleStep(10.0)
+        self.edge_blur_spin.setDecimals(0)
+        self.edge_blur_spin.setSuffix(" %")
+        self.edge_blur_spin.setValue(0.0)
+        self.edge_blur_spin.setToolTip(
+            "Cinematic edge blur (depth of field): the frame's borders get\n"
+            "softly out of focus while the playfield stays sharp. 0% = off.")
+        grid.addWidget(self._wrap_labeled("Edge blur (DoF)", self.edge_blur_spin), 1, 1)
+
+        # ── Picture-in-picture ──────────────────────────────────────────
+        grid.addWidget(self._subsection_label("Picture-in-picture"), 2, 0, 1, 2)
+
+        self.pip_path_edit = QLineEdit()
+        self.pip_path_edit.setPlaceholderText("Optional picture-in-picture video (webcam…)")
+        pip_browse = QPushButton("Browse")
+        pip_browse.clicked.connect(self.pick_pip)
+        pip_clear = QPushButton("×")
+        pip_clear.setObjectName("secondaryButton")
+        pip_clear.setFixedSize(30, 30)
+        pip_clear.clicked.connect(self.pip_path_edit.clear)
+        pip_row = QHBoxLayout()
+        pip_row.setSpacing(8)
+        pip_row.addWidget(self.pip_path_edit, 1)
+        pip_row.addWidget(pip_browse)
+        pip_row.addWidget(pip_clear)
+        grid.addWidget(self._wrap_labeled("PiP overlay video", self._hbox_widget(pip_row)), 3, 0, 1, 2)
+
+        self.pip_corner_combo = QComboBox()
+        self.pip_corner_combo.addItems(PIP_CORNERS)
+        self._style_combobox(self.pip_corner_combo)
+        self.pip_scale_spin = QDoubleSpinBox()
+        self.pip_scale_spin.setRange(5.0, 50.0)
+        self.pip_scale_spin.setSingleStep(2.0)
+        self.pip_scale_spin.setDecimals(0)
+        self.pip_scale_spin.setSuffix(" %")
+        self.pip_scale_spin.setValue(22.0)
+        self.pip_scale_spin.setToolTip("PiP width as % of the video width.")
+        pip_opts = QHBoxLayout()
+        pip_opts.setSpacing(10)
+        pip_opts.addWidget(self.pip_corner_combo, 1)
+        pip_opts.addWidget(self.pip_scale_spin)
+        grid.addWidget(self._wrap_labeled("PiP corner & size", self._hbox_widget(pip_opts)), 4, 0, 1, 2)
+
+        card.set_body_widget(body)
+        return card
+
+    def pick_pip(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose PiP video", "",
+            "Videos (*.mp4 *.mkv *.webm *.mov *.avi);;All files (*)")
+        if path:
+            self.pip_path_edit.setText(path)
 
     # ── Render presets ─────────────────────────────────────────────────
 
@@ -1432,6 +1812,7 @@ class MainWindow(QWidget):
             "spawn": self.spawn_distance_spin.value(),
             "approach": self.approach_rate_spin.value(),
             "parallax": self.parallax_check.isChecked(),
+            "playfield_scale": self.playfield_scale_spin.value(),
             "trail": self.trail_check.isChecked(),
             "dots": self.bg_dots_check.isChecked(),
             "hit_fx": self.hit_fx_check.isChecked(),
@@ -1448,31 +1829,57 @@ class MainWindow(QWidget):
             "bg_path": self.bg_path_edit.text().strip(),
             "bg_brightness": self.bg_brightness_spin.value(),
             "layout": {k: list(v) for k, v in self.preview_label.offsets.items()},
+            "dynamic_camera": self.fx_camera_check.isChecked(),
+            "beat_pulse_on": self.fx_beat_check.isChecked(),
+            "beat_pulse": self.beat_pulse_spin.value(),
+            "miss_particles": self.fx_particles_check.isChecked(),
+            "spawn_particles": self.fx_spawn_particles_check.isChecked(),
+            "note_anim": self.fx_spawn_check.isChecked(),
+            "reverse": self.reverse_check.isChecked(),
+            "edge_blur": self.edge_blur_spin.value(),
+            "pip_path": self.pip_path_edit.text().strip(),
+            "pip_corner": self.pip_corner_combo.currentText(),
+            "pip_scale": self.pip_scale_spin.value(),
         }
 
     def _apply_render_settings(self, p: dict):
         for key, combo in (("resolution", self.resolution_combo), ("quality", self.quality_combo),
                            ("blur_mode", self.motion_blur_combo), ("codec", self.codec_combo),
-                           ("hw", self.hw_combo), ("audio_bitrate", self.audio_combo)):
+                           ("hw", self.hw_combo), ("audio_bitrate", self.audio_combo),
+                           ("pip_corner", self.pip_corner_combo)):
             val = p.get(key, "")
             if val and combo.findText(val) >= 0:
                 combo.setCurrentText(val)
         for key, spin in (("spawn", self.spawn_distance_spin), ("approach", self.approach_rate_spin),
                           ("trail_length", self.trail_length_spin), ("blur_intensity", self.motion_blur_spin),
                           ("music_volume", self.music_volume_spin), ("hitsound_volume", self.hit_volume_spin),
-                          ("bg_brightness", self.bg_brightness_spin)):
+                          ("bg_brightness", self.bg_brightness_spin),
+                          ("beat_pulse", self.beat_pulse_spin), ("edge_blur", self.edge_blur_spin),
+                          ("pip_scale", self.pip_scale_spin), ("playfield_scale", self.playfield_scale_spin)):
             if key in p:
                 spin.setValue(float(p[key]))
         for key, check in (("parallax", self.parallax_check), ("trail", self.trail_check),
                            ("dots", self.bg_dots_check), ("hit_fx", self.hit_fx_check),
-                           ("intro", self.intro_check)):
+                           ("intro", self.intro_check),
+                           ("dynamic_camera", self.fx_camera_check),
+                           ("beat_pulse_on", self.fx_beat_check),
+                           ("miss_particles", self.fx_particles_check),
+                           ("spawn_particles", self.fx_spawn_particles_check),
+                           ("note_anim", self.fx_spawn_check),
+                           ("reverse", self.reverse_check)):
             if key in p:
                 check.setChecked(bool(p[key]))
-        for flag, shown in (p.get("hud") or {}).items():
+        hud = p.get("hud") or {}
+        for flag, shown in hud.items():
             if flag in self.hud_checks:
                 self.hud_checks[flag].setChecked(bool(shown))
+        if "hud" in p:
+            self.hidden_assets = {str(n) for n in (hud.get("hidden_layer_names") or [])}
+            self.preview_label.hidden_assets_count = len(self.hidden_assets)
         if "bg_path" in p:
             self.bg_path_edit.setText(p["bg_path"])
+        if "pip_path" in p:
+            self.pip_path_edit.setText(p["pip_path"])
         if "layout" in p:
             self.preview_label.offsets.clear()
             self.preview_label.offsets.update(
@@ -1526,6 +1933,92 @@ class MainWindow(QWidget):
         self._settings.setValue("render_presets", json.dumps(presets))
         self._reload_render_preset_combo()
 
+    # ── Shareable preset bundles (.rhrp) ─────────────────────────────────
+
+    def _export_preset_bundle(self):
+        from ..presets import BUNDLE_EXT, export_bundle
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export preset bundle", f"my-preset{BUNDLE_EXT}",
+            f"rhr2mp4 preset (*{BUNDLE_EXT})")
+        if not path:
+            return
+        if not path.lower().endswith(BUNDLE_EXT):
+            path += BUNDLE_EXT
+
+        settings = self._collect_render_settings()
+        settings["colors"] = self._collect_colors()
+        settings["color_preset"] = self.color_preset_combo.currentText()
+        w, h, fps = RESOLUTIONS[self.resolution_combo.currentText()]
+        resolved = {
+            "width": w, "height": h, "fps": fps,
+            "quality": QUALITIES[self.quality_combo.currentText()],
+            "codec": CODECS[self.codec_combo.currentText()],
+            "hw": HW_ACCELS[self.hw_combo.currentText()],
+            "audio_bitrate": AUDIO_BITRATES[self.audio_combo.currentText()],
+            "music_volume": self.music_volume_spin.value(),
+            "hitsound_volume": self.hit_volume_spin.value(),
+            "spawn": self.spawn_distance_spin.value(),
+            "approach": self.approach_rate_spin.value(),
+            "trail_length": self.trail_length_spin.value(),
+            "blur_mode": MOTION_BLUR_MODES[self.motion_blur_combo.currentText()],
+            "blur_intensity": self.motion_blur_spin.value(),
+            "bg_path": self.bg_path_edit.text().strip(),
+            "bg_brightness": self.bg_brightness_spin.value(),
+            "hud": self._hud_overrides(),
+            "layout": {k: list(v) for k, v in self.preview_label.offsets.items()},
+            "dynamic_camera": self.fx_camera_check.isChecked(),
+            "beat_pulse": self.beat_pulse_spin.value() if self.fx_beat_check.isChecked() else 0,
+            "miss_particles": self.fx_particles_check.isChecked(),
+            "spawn_particles": self.fx_spawn_particles_check.isChecked(),
+            "note_anim": self.fx_spawn_check.isChecked(),
+            "reverse": self.reverse_check.isChecked(),
+            "edge_blur": self.edge_blur_spin.value(),
+            "playfield_scale": self.playfield_scale_spin.value(),
+        }
+        try:
+            export_bundle(path, settings, resolved,
+                          skin_path=self.skin_field.path or None,
+                          colorset_path=self.colorset_field.path or None)
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"Could not write the bundle:\n{e}")
+            return
+        self.status_label.setText(f"Preset bundle exported: {os.path.basename(path)}")
+
+    def _import_preset_bundle(self):
+        from ..presets import BUNDLE_EXT, load_bundle
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import preset bundle", "", f"rhr2mp4 preset (*{BUNDLE_EXT})")
+        if not path:
+            return
+        try:
+            settings, _resolved, skin_path, colorset_path = load_bundle(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Import failed", f"Could not read the bundle:\n{e}")
+            return
+        self._apply_render_settings(settings)
+        if skin_path:
+            self.skin_field.set_path(skin_path)
+        if colorset_path:
+            self.colorset_field.set_path(colorset_path)
+        colors = settings.get("colors")
+        if colors and settings.get("color_preset") != FROM_SKIN_PRESET:
+            # Save the bundle's colors as a user color preset (named after
+            # the bundle) and select it, so they actually apply and survive.
+            import json
+            name = os.path.splitext(os.path.basename(path))[0] or "imported"
+            if name == FROM_SKIN_PRESET or name in BUILTIN_COLOR_PRESETS or name.startswith(GAME_PRESET_PREFIX):
+                name += " (imported)"
+            user = self._user_color_presets()
+            user[name] = colors
+            self._settings.setValue("user_color_presets", json.dumps(user))
+            self._reload_preset_combo()
+            self.color_preset_combo.setCurrentText(name)
+        self._save_settings()
+        self.status_label.setText(f"Preset bundle applied: {os.path.basename(path)}")
+        self._schedule_auto_preview()
+
     # ── HUD visibility card (collapsible, starts collapsed) ───────────
 
     def _make_hud_card(self) -> CollapsibleCard:
@@ -1537,7 +2030,8 @@ class MainWindow(QWidget):
         v.setSpacing(12)
 
         hint = QLabel("Checked elements are always drawn (even if the skin hides them); "
-                      "uncheck to hide them from the video.")
+                      "uncheck to hide them from the video. Tip: right-clicking an "
+                      "element on the preview hides it too.")
         hint.setObjectName("fieldLabel")
         hint.setWordWrap(True)
         v.addWidget(hint)
@@ -1553,6 +2047,10 @@ class MainWindow(QWidget):
             if flag == "hit_error_bar_enabled":
                 cb.setToolTip("osu!-style hit-error bar at the bottom of the playfield:\n"
                               "a tick per hit showing how early/late it was.")
+            elif flag == "border_enabled":
+                cb.setToolTip("The playfield frame (the skin's border image, or the\n"
+                              "default thin rounded rectangle). Uncheck for a borderless look.")
+            cb.toggled.connect(self._schedule_auto_preview)
             self.hud_checks[flag] = cb
             grid.addWidget(cb, i // 3, i % 3)
         v.addLayout(grid)
@@ -1574,7 +2072,10 @@ class MainWindow(QWidget):
         return card
 
     def _hud_overrides(self) -> dict:
-        return {flag: cb.isChecked() for flag, cb in self.hud_checks.items()}
+        overrides = {flag: cb.isChecked() for flag, cb in self.hud_checks.items()}
+        if self.hidden_assets:
+            overrides["hidden_layer_names"] = sorted(self.hidden_assets)
+        return overrides
 
     # ── Optional resources card (collapsible, starts collapsed) ───────
 
@@ -1626,8 +2127,33 @@ class MainWindow(QWidget):
         watch_row = self._line_row("Watched folder", self.watch_dir_edit, watch_browse)
         grid.addWidget(watch_row, 1, 1, 1, 2)
 
+        # Ghost race: a second replay of the same map overlaid on the video
+        # (its cursor in a distinct color + a side-by-side stats panel).
+        self.ghost_field = DropField("Optional ghost replay (.rhr)", ".rhr")
+        self.ghost_field.setToolTip("A second replay of the SAME map, overlaid as a ghost race:\n"
+                                    "its cursor is drawn in orange with a versus stats panel.")
+        self.ghost_field.clicked.connect(self.pick_ghost)
+        ghost_clear = QPushButton("Clear")
+        ghost_clear.clicked.connect(self.ghost_field.clear_path)
+        grid.addWidget(self._file_row("Ghost race replay", self.ghost_field, ghost_clear), 2, 0)
+
+        # Post-render webhook (Discord-compatible): message + the video
+        # attached when it fits Discord's upload limit.
+        self.webhook_edit = QLineEdit()
+        self.webhook_edit.setPlaceholderText("Optional Discord webhook URL (posts the finished video)")
+        webhook_clear = QPushButton("×")
+        webhook_clear.setObjectName("secondaryButton")
+        webhook_clear.clicked.connect(self.webhook_edit.clear)
+        grid.addWidget(self._line_row("Webhook (post-render)", self.webhook_edit, webhook_clear), 2, 1, 1, 2)
+
         card.set_body_widget(body)
         return card
+
+    def pick_ghost(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose ghost replay", "",
+                                              "Rhythia Replay (*.rhr)")
+        if path:
+            self.ghost_field.set_path(path)
 
     # ── Watch folder ───────────────────────────────────────────────────
 
@@ -1974,10 +2500,16 @@ class MainWindow(QWidget):
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.preview_label.setToolTip(
             "Drag a HUD element (title, panels, combo, health bar, timing bar)\n"
-            "to reposition it in the video. Double-click one to reset it.")
+            "to reposition it in the video. Double-click one to reset it,\n"
+            "right-click one to hide it. Right-clicking a skin image (mascots,\n"
+            "decorations) hides it too.")
         self.preview_label.rects_provider = self._layout_rects
+        self.preview_label.asset_rects_provider = self._asset_rects
         self.preview_label.layoutChanged.connect(self._on_layout_dragged)
         self.preview_label.layoutCommitted.connect(self._on_layout_committed)
+        self.preview_label.hideRequested.connect(self._hide_layout_element)
+        self.preview_label.hideAssetRequested.connect(self._hide_skin_asset)
+        self.preview_label.showAssetsRequested.connect(self._show_hidden_assets)
         v.addWidget(self.preview_label, 1)
 
         # Live redraw while dragging, debounced to stay responsive.
@@ -2104,6 +2636,7 @@ class MainWindow(QWidget):
                        "left_panel_accuracy_enabled"),
         "right_panel": ("right_panel_score_enabled", "right_panel_points_enabled",
                         "right_panel_misses_enabled", "right_panel_notes_enabled"),
+        "stats": ("live_stats_enabled",),
     }
 
     def _layout_rects(self) -> dict | None:
@@ -2118,6 +2651,9 @@ class MainWindow(QWidget):
         for name, (x, y, w, h) in element_rects(ctx).items():
             flags = self._LAYOUT_VISIBILITY.get(name, ())
             if flags and not any(self.hud_checks[f].isChecked() for f in flags if f in self.hud_checks):
+                continue
+            # The versus panel only exists when a ghost replay is loaded.
+            if name == "versus" and not self.ghost_field.path:
                 continue
             out[name] = (x / ctx.width, y / ctx.height, w / ctx.width, h / ctx.height)
         return out
@@ -2140,6 +2676,62 @@ class MainWindow(QWidget):
             return
         self.preview_label.offsets.clear()
         self.status_label.setText("HUD layout reset to the stock positions.")
+        self._render_preview()
+        self._schedule_auto_preview()
+
+    def _hide_layout_element(self, name: str):
+        """Right-click > Hide on the preview: unchecks the element's HUD
+        checkbox(es), so it disappears from both the preview and the render.
+        Re-checking it in the HUD ELEMENTS card brings it back."""
+        label = LayoutPreviewLabel.ELEMENT_LABELS.get(name, name.replace("_", " "))
+        if name == "versus":
+            # Not a HUD flag: the panel exists only while a ghost replay is
+            # loaded, so removing the replay is what removes the panel.
+            self.status_label.setText("The versus panel follows the ghost replay — "
+                                      "clear the ghost replay field to remove it.")
+            return
+        flags = self._LAYOUT_VISIBILITY.get(name, ())
+        if not flags:
+            return
+        for flag in flags:
+            if flag in self.hud_checks:
+                self.hud_checks[flag].setChecked(False)
+        self.status_label.setText(f"Hidden: {label} — re-check it in the HUD ELEMENTS "
+                                  "card to bring it back.")
+        self._render_preview()
+        self._schedule_auto_preview()
+
+    # ── Skin image assets (right-click hide on the preview) ────────────
+
+    def _asset_rects(self) -> dict | None:
+        """Normalized boxes of the skin's decorative background images still
+        on screen, for the preview's right-click hit-testing."""
+        cache = getattr(self, "_preview_cache", None)
+        if not cache:
+            return None
+        from ..render.frame import background_layer_rects
+        _, ctx, _ = cache
+        out = {}
+        for name, (x, y, w, h) in background_layer_rects(ctx.skin, ctx.width, ctx.height).items():
+            if name in self.hidden_assets:
+                continue
+            out[name] = (x / ctx.width, y / ctx.height, w / ctx.width, h / ctx.height)
+        return out
+
+    def _hide_skin_asset(self, name: str):
+        self.hidden_assets.add(name)
+        self.preview_label.hidden_assets_count = len(self.hidden_assets)
+        self.status_label.setText(f"Hidden: skin image {name} — right-click the preview "
+                                  "to show hidden images again.")
+        self._render_preview()
+        self._schedule_auto_preview()
+
+    def _show_hidden_assets(self):
+        if not self.hidden_assets:
+            return
+        self.hidden_assets.clear()
+        self.preview_label.hidden_assets_count = 0
+        self.status_label.setText("All skin images are visible again.")
         self._render_preview()
         self._schedule_auto_preview()
 
@@ -2315,6 +2907,7 @@ class MainWindow(QWidget):
             "spawn": self.spawn_distance_spin.value(),
             "approach": self.approach_rate_spin.value(),
             "parallax": self.parallax_check.isChecked(),
+            "playfield_scale": self.playfield_scale_spin.value() / 100.0,
             "trail": self.trail_check.isChecked(),
             "dots": self.bg_dots_check.isChecked(),
             "trail_scale": self.trail_length_spin.value() / 100.0,
@@ -2370,6 +2963,7 @@ class MainWindow(QWidget):
             self.bg_dots_check.isChecked(), self.trail_length_spin.value(),
             self.hit_fx_check.isChecked(), repr(sorted(self._hud_overrides().items())),
             self.bg_path_edit.text().strip(), self.bg_brightness_spin.value(),
+            self.playfield_scale_spin.value(),
         )
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -2411,6 +3005,7 @@ class MainWindow(QWidget):
                 # element_offsets is the label's live dict: drags mutate it
                 # in place and only redraw, no context rebuild.
                 ctx = build_context(1280, 720, game_map.cover_bytes, runtime, playfield_extent=extent,
+                                    playfield_scale=self.playfield_scale_spin.value() / 100.0,
                                     background_image_bytes=bg_image, background_brightness=bg_brightness,
                                     element_offsets=self.preview_label.offsets)
                 ctx.mods_label = mods_label
@@ -2425,12 +3020,15 @@ class MainWindow(QWidget):
             frame_dt_ms = 1000.0 / fps * speed
             mode = MOTION_BLUR_MODES[self.motion_blur_combo.currentText()]
             motion_blur = self.motion_blur_spin.value() / 100.0 if mode != "off" else 0.0
+            draw_started = time.perf_counter()
             if mode == "subframe":
                 img = draw_frame_blurred(ctx, timeline, game_map.metadata, replay,
                                          t, frame_dt_ms, motion_blur)
             else:
                 img = draw_frame_tmix(ctx, timeline, game_map.metadata, replay,
                                       t, frame_dt_ms, motion_blur)
+            self._show_render_estimate(time.perf_counter() - draw_started,
+                                       ctx.width * ctx.height, replay, fps, speed)
             qimg = QImage(img.tobytes(), img.width, img.height, img.width * 3, QImage.Format_RGB888)
             pix = QPixmap.fromImage(qimg).scaled(
                 max(320, self.preview_label.width()), max(240, self.preview_label.height()),
@@ -2439,9 +3037,40 @@ class MainWindow(QWidget):
             self.preview_label.setPixmap(pix)
             self._update_preview_time_label(self.preview_slider.value())
         except Exception as e:
-            QMessageBox.critical(self, "Preview error", f"Could not render the preview:\n{e}")
+            import traceback
+            tb = traceback.extract_tb(e.__traceback__)
+            where = f"\n\nat {tb[-1].filename}:{tb[-1].lineno}" if tb else ""
+            QMessageBox.critical(self, "Preview error",
+                                 f"Could not render the preview:\n{e}{where}")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _show_render_estimate(self, draw_s: float, preview_px: int, replay, fps: int, speed: float):
+        """Pre-render time estimate shown in the ETA label while idle: the
+        measured preview frame cost scaled to the output resolution and
+        frame count, divided across the render workers. Rough (encoding and
+        process overhead aren't modeled) but sets expectations before the
+        Start button is pressed."""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if draw_s <= 0 or preview_px <= 0 or not replay.length_ms:
+            return
+        try:
+            start_ms, end_ms = self._clip_range()
+        except ValueError:
+            start_ms = end_ms = None
+        start_ms = start_ms or 0.0
+        end_ms = end_ms if end_ms is not None else replay.length_ms
+        if end_ms <= start_ms:
+            return
+        self._last_draw_s = draw_s
+        self._last_preview_px = preview_px
+        total_frames = (end_ms - start_ms) / speed / 1000.0 * fps
+        width, height, _ = RESOLUTIONS[self.resolution_combo.currentText()]
+        est = self._estimate_seconds(total_frames, width, height)
+        if est is not None:
+            self.eta_label.setText(f"est. render ~{_format_duration(est)}")
+        self._update_queue_eta()
 
     # ── Window-wide drag & drop routing ───────────────────────────────
 
@@ -2600,6 +3229,14 @@ class MainWindow(QWidget):
         layout.addWidget(lbl)
         layout.addWidget(widget)
         return container
+
+    def _subsection_label(self, text: str) -> QLabel:
+        """Small uppercase divider between groups of related fields inside a
+        single card body (e.g. "OUTPUT" vs "GAMEPLAY & CAMERA" inside RENDER
+        SETTINGS) -- subtler than a card's own sectionTitle."""
+        lbl = QLabel(text)
+        lbl.setObjectName("subsectionLabel")
+        return lbl
 
     def _file_row(self, label: str, field: QWidget, clear_button: QPushButton) -> QWidget:
         container = QWidget()
@@ -2794,14 +3431,29 @@ class MainWindow(QWidget):
     # animated gifs actually play instead of freezing on their first frame.
     _VIDEO_BG_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".gif")
 
-    def _background_still_bytes(self) -> bytes | None:
-        """Image bytes for the preview: the image itself, or one decoded
-        frame when the background is a video/gif (cached per file)."""
-        bg_image, bg_video, _ = self._background_args()
-        if bg_image is not None or not bg_video:
-            return bg_image
+    @staticmethod
+    def _pil_readable(data: bytes) -> bool:
         try:
-            key = (bg_video, os.path.getmtime(bg_video))
+            import io
+            from PIL import Image
+            Image.open(io.BytesIO(data))
+            return True
+        except Exception:
+            return False
+
+    def _background_still_bytes(self) -> bytes | None:
+        """Image bytes for the preview/render, guaranteed Pillow-readable:
+        the image itself, or one decoded frame when the background is a
+        video/gif or an image format Pillow can't identify (AVIF/HEIC on a
+        stock Pillow, typically) -- ffmpeg converts those (cached per file)."""
+        bg_image, bg_video, _ = self._background_args()
+        if bg_image is not None and self._pil_readable(bg_image):
+            return bg_image
+        src = bg_video or self.bg_path_edit.text().strip()
+        if not src:
+            return None
+        try:
+            key = (src, os.path.getmtime(src))
         except OSError:
             return None
         cache = getattr(self, "_bg_still_cache", None)
@@ -2810,13 +3462,15 @@ class MainWindow(QWidget):
         from ..paths import ffmpeg_exe
         try:
             out = subprocess.run(
-                [ffmpeg_exe() or "ffmpeg", "-v", "error", "-nostdin", "-i", bg_video,
+                [ffmpeg_exe() or "ffmpeg", "-v", "error", "-nostdin", "-i", src,
                  "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, timeout=15,
             ).stdout or None
         except Exception:
             out = None
+        if out is not None and not self._pil_readable(out):
+            out = None  # truncated/partial ffmpeg output must not reach Image.open
         if out is None:
             # Formats ffmpeg can't decode (animated WebP with a .gif
             # extension, typically) still preview via Pillow.
@@ -2824,7 +3478,7 @@ class MainWindow(QWidget):
                 import io
                 from PIL import Image
                 buf = io.BytesIO()
-                Image.open(bg_video).convert("RGB").save(buf, "PNG")
+                Image.open(src).convert("RGB").save(buf, "PNG")
                 out = buf.getvalue()
             except Exception:
                 out = None
@@ -3104,7 +3758,17 @@ class MainWindow(QWidget):
         self._set_progress_active(True)
         self._eta_timer.start()
 
-        bg_image, bg_video, bg_brightness = self._background_args()
+        _, bg_video, bg_brightness = self._background_args()
+        bg_image = self._background_still_bytes() if not bg_video else None
+        extra = self._effects_kwargs()
+        if self.ghost_field.path:
+            try:
+                ghost = rhr.load(self.ghost_field.path)
+            except Exception as e:
+                QMessageBox.warning(self, "Ghost replay error",
+                                    f"Could not read the ghost replay (ignored):\n{e}")
+            else:
+                extra["ghost_replay"] = ghost
         self.worker = RenderWorker(replay, game_map, skin, output_path, width, height, fps,
                                     quality, spawn_distance, approach_rate, parallax_enabled,
                                     trail_enabled, note_colors, video_codec, hw_accel, audio_bitrate,
@@ -3114,11 +3778,147 @@ class MainWindow(QWidget):
                                     self._hud_overrides(),
                                     self.music_volume_spin.value(), self.hit_volume_spin.value(),
                                     bg_image, bg_video, bg_brightness,
-                                    self._element_offsets_snapshot())
+                                    self._element_offsets_snapshot(),
+                                    extra)
         self.worker.progress.connect(self.on_progress)
         self.worker.finished_ok.connect(self.on_finished_ok)
         self.worker.failed.connect(self.on_failed)
         self.worker.start()
+
+    def _effects_kwargs(self) -> dict:
+        """Extra render_video kwargs from the effects/PiP controls (shared
+        by the single render and every montage clip)."""
+        extra = {
+            "reverse": self.reverse_check.isChecked(),
+            "dynamic_camera": self.fx_camera_check.isChecked(),
+            "beat_pulse": (self.beat_pulse_spin.value() / 100.0
+                           if self.fx_beat_check.isChecked() else 0.0),
+            "miss_particles": self.fx_particles_check.isChecked(),
+            "spawn_particles": self.fx_spawn_particles_check.isChecked(),
+            "note_spawn_anim": self.fx_spawn_check.isChecked(),
+            "edge_blur": self.edge_blur_spin.value() / 100.0,
+            "playfield_scale": self.playfield_scale_spin.value() / 100.0,
+        }
+        pip = self.pip_path_edit.text().strip()
+        if pip and os.path.isfile(pip):
+            extra["pip_video"] = pip
+            extra["pip_corner"] = self.pip_corner_combo.currentText()
+            extra["pip_scale"] = self.pip_scale_spin.value() / 100.0
+        return extra
+
+    # ── Montage (highlight reel from the queue) ───────────────────────
+
+    def _start_montage(self):
+        if self.worker is not None and self.worker.isRunning():
+            self.status_label.setText("Wait for the current render to finish first.")
+            return
+
+        sources: list[tuple[str, str]] = []
+        if self.rhr_path and self.rhm_path:
+            sources.append((self.rhr_path, self.rhm_path))
+        sources += [(item["rhr"], item["rhm"]) for item in self.render_queue if item["rhm"]]
+        # De-duplicate while keeping order (the loaded replay may also be queued).
+        seen = set()
+        sources = [s for s in sources if not (s[0] in seen or seen.add(s[0]))]
+        if len(sources) < 2:
+            self.status_label.setText(
+                "Montage needs at least 2 replays: load one and queue more "
+                "(drop several .rhr files on the window).")
+            return
+
+        default_dir = self._preferred_output_dir(sources[0][0])
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "Save highlight reel as", os.path.join(default_dir, "highlights.mp4"),
+            "MP4 video (*.mp4)")
+        if not output_path:
+            return
+
+        # Skin/colorset are optional here (the montage can run straight off
+        # the queue with no replay loaded), so don't pop dialogs.
+        inputs = self._load_render_inputs(interactive=False)
+        skin = note_colors = None
+        if inputs is not None:
+            _, _, skin, note_colors, _ = inputs
+
+        width, height, fps = RESOLUTIONS[self.resolution_combo.currentText()]
+        motion_blur_mode = MOTION_BLUR_MODES[self.motion_blur_combo.currentText()]
+        render_kwargs = dict(
+            skin=skin,
+            note_colors=note_colors,
+            hw_accel=HW_ACCELS[self.hw_combo.currentText()],
+            audio_bitrate=AUDIO_BITRATES[self.audio_combo.currentText()],
+            spawn_distance=self.spawn_distance_spin.value(),
+            approach_rate=self.approach_rate_spin.value(),
+            parallax_enabled=self.parallax_check.isChecked(),
+            trail_enabled=self.trail_check.isChecked(),
+            background_dots_enabled=self.bg_dots_check.isChecked(),
+            trail_scale=self.trail_length_spin.value() / 100.0,
+            motion_blur=(self.motion_blur_spin.value() / 100.0
+                         if motion_blur_mode != "off" else 0.0),
+            motion_blur_mode=motion_blur_mode if motion_blur_mode != "off" else "filter",
+            hit_effects_enabled=self.hit_fx_check.isChecked(),
+            color_overrides=self._color_overrides(),
+            hud_overrides=self._hud_overrides(),
+            music_volume=self.music_volume_spin.value(),
+            hit_sound_volume=self.hit_volume_spin.value(),
+            element_offsets=self._element_offsets_snapshot(),
+        )
+        _, bg_video, bg_brightness = self._background_args()
+        bg_image = self._background_still_bytes() if not bg_video else None
+        render_kwargs.update(background_image=bg_image, background_video=bg_video,
+                             background_brightness=bg_brightness)
+        extra = self._effects_kwargs()
+        extra.pop("reverse", None)  # a reversed highlight reel reads as a bug
+        render_kwargs.update(extra)
+
+        self.render_queue.clear()
+        self._refresh_queue_ui()
+
+        clip_ms = 15000.0
+        est = self._estimate_seconds(clip_ms / 1000.0 * fps * len(sources), width, height)
+        est_note = f" · est. ~{_format_duration(est)}" if est is not None else ""
+
+        self.progress_bar.setValue(0)
+        self._colorset_note = f" · montage ({len(sources)} clips)"
+        self._render_start_time = time.monotonic()
+        self._last_done = 0
+        self._last_total = 0
+        self.status_label.setText(f"Rendering montage…{self._colorset_note}{est_note}")
+        self.eta_label.setText("00:00 elapsed")
+        self.render_button.setText("■  Cancel")
+        self._set_render_button_state("cancel")
+        self._set_progress_active(True)
+        self._eta_timer.start()
+
+        self.worker = MontageWorker(
+            sources, output_path, clip_ms,
+            self.montage_transition_combo.currentText(),
+            width, height, fps, QUALITIES[self.quality_combo.currentText()],
+            CODECS[self.codec_combo.currentText()], render_kwargs)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished_ok.connect(self.on_finished_ok)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    # ── Post-render webhook ────────────────────────────────────────────
+
+    def _fire_webhook(self, output_path: str):
+        url = self.webhook_edit.text().strip()
+        if not url:
+            return
+        import threading
+
+        def _post():
+            from ..post import send_webhook
+            try:
+                send_webhook(url, f"Render finished: {os.path.basename(output_path)}",
+                             output_path)
+                self.webhook_status.emit("✓ Posted to webhook")
+            except RuntimeError as e:
+                self.webhook_status.emit(f"⚠ {e}")
+
+        self.status_label.setText("Posting to webhook…")
+        threading.Thread(target=_post, daemon=True).start()
 
     def on_progress(self, done: int, total: int):
         pct = int(100 * done / total) if total else 0
@@ -3159,6 +3959,7 @@ class MainWindow(QWidget):
 
         # Batch: chain straight into the next queued replay.
         if self.render_queue and self._load_next_queue_item():
+            self._fire_webhook(output_path)
             QTimer.singleShot(100, lambda: self.start_render(from_queue=True))
             return
 
@@ -3169,6 +3970,7 @@ class MainWindow(QWidget):
         else:
             self.status_label.setText(f"✓ Done in {elapsed_str} — {os.path.basename(output_path)}")
             self._notify("rhr2mp4 — render complete", os.path.basename(output_path))
+        self._fire_webhook(output_path)
 
     def on_failed(self, message: str):
         self._eta_timer.stop()

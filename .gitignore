@@ -24,3 +24,6 @@ packaging/appimagetool-x86_64.AppImage
 .idea/
 .vscode/
 .DS_Store
+
+# Shareable preset bundles made during local testing
+*.rhrp

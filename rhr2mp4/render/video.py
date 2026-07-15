@@ -18,6 +18,7 @@ combined at the end.
 
 from __future__ import annotations
 
+import math
 import multiprocessing as mp
 import os
 import shutil
@@ -66,6 +67,54 @@ def _probe_duration_s(path: str) -> float:
         return max(0.0, float(out))
     except Exception:
         return 0.0
+
+def _probe_video_size(path: str) -> tuple[int, int] | None:
+    """(width, height) of a video's first stream via ffprobe, or None when it
+    can't be determined (used to size the PiP rounded-corner/border masks to
+    match its actual aspect ratio)."""
+    candidates = []
+    ff = ffmpeg_exe()
+    if ff:
+        name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+        candidates.append(os.path.join(os.path.dirname(ff), name))
+    probe = next((c for c in candidates if os.path.isfile(c)), None) or shutil.which("ffprobe")
+    if not probe:
+        return None
+    try:
+        out = subprocess.run(
+            [probe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height", "-of", "csv=s=x:p=0", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, timeout=15,
+        ).stdout.decode().strip()
+        w, h = out.split("x")
+        return (int(w), int(h))
+    except Exception:
+        return None
+
+
+def _write_pip_masks(mask_path: str, border_path: str, width: int, height: int,
+                     radius_frac: float = 0.12, border_color: tuple[int, int, int] = (255, 255, 255),
+                     border_opacity: float = 0.85) -> None:
+    """Two PNGs sized to the PiP overlay: a plain rounded-rect alpha mask
+    (for alphamerge, cutting the webcam feed's corners) and a border-only
+    ring in the same shape (overlaid on top so the corner cut reads as a
+    frame rather than a crop)."""
+    from PIL import Image, ImageDraw
+
+    radius = max(2, int(min(width, height) * radius_frac))
+    mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, width - 1, height - 1], radius=radius, fill=255)
+    mask.save(mask_path)
+
+    border = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    bw = max(1, round(min(width, height) * 0.012))
+    alpha = int(255 * border_opacity)
+    ImageDraw.Draw(border).rounded_rectangle(
+        [bw / 2, bw / 2, width - 1 - bw / 2, height - 1 - bw / 2],
+        radius=radius, outline=(*border_color, alpha), width=bw)
+    border.save(border_path)
+
 
 def _probe_decodable(path: str) -> bool:
     """Whether ffmpeg can actually decode video frames from this file.
@@ -356,6 +405,95 @@ def _detect_audio_ext(data: bytes) -> str:
     return "mp3"
 
 
+def _onset_envelope(audio_bytes: bytes, ext: str, window_ms: float = 20.0) -> tuple[float, list[float]] | None:
+    """Music onset envelope for the beat-pulse effect: mean absolute PCM
+    amplitude per `window_ms` window with a ~0.6s moving-average baseline
+    subtracted, normalized to 0..1 -- so sustained loudness doesn't glow
+    permanently, only actual hits/onsets pulse. Returns (window_ms, values)
+    in song time, or None when the audio can't be decoded."""
+    import numpy as np
+
+    from .audio import SAMPLE_RATE, _decode_to_pcm
+
+    try:
+        pcm = _decode_to_pcm(audio_bytes, ext)
+    except Exception:
+        return None
+    if len(pcm) == 0:
+        return None
+    mono = np.abs(pcm.astype(np.float32)).mean(axis=1)
+    win = max(1, int(SAMPLE_RATE * window_ms / 1000.0))
+    n = len(mono) // win
+    if n == 0:
+        return None
+    levels = mono[: n * win].reshape(n, win).mean(axis=1)
+    k = max(1, int(600.0 / window_ms))
+    baseline = np.convolve(levels, np.ones(k) / k, mode="same")
+    onset = np.clip(levels - baseline, 0.0, None)
+    peak = float(np.percentile(onset, 97))
+    if peak <= 1e-6:
+        return None
+    env = np.clip(onset / peak, 0.0, 1.0)
+    return (window_ms, [float(v) for v in env])
+
+
+def _write_edge_blur_mask(path: str, width: int, height: int, intensity: float,
+                          center: tuple[float, float] = (0.5, 0.5)) -> None:
+    """Radial gray mask for the edge-blur (depth-of-field) pass: black around
+    `center` (sharp), ramping to white towards the far corners (fully
+    blurred). `intensity` widens how far in the blur reaches. `center` is in
+    0..1 canvas fractions -- see `_replay_focus_point` for how it's picked."""
+    import numpy as np
+    from PIL import Image
+
+    cx, cy = center[0] * width, center[1] * height
+    # Normalize by the largest distance from center to a corner so the ramp
+    # still reaches full blur at the far edges even when center is off-axis.
+    max_dist = max(
+        math.hypot(cx, cy), math.hypot(width - cx, cy),
+        math.hypot(cx, height - cy), math.hypot(width - cx, height - cy),
+    ) or 1.0
+    yy, xx = np.mgrid[0:height, 0:width]
+    dist = np.sqrt(((xx - cx) / max_dist) ** 2 + ((yy - cy) / max_dist) ** 2)
+    # Sharp radius shrinks with intensity: at 1.0 the blur starts ~35% out.
+    start = max(0.15, 0.75 - 0.4 * min(1.0, intensity))
+    ramp = np.clip((dist - start) / max(1e-3, 1.0 - start), 0.0, 1.0) ** 1.5
+    Image.fromarray((ramp * 255).astype(np.uint8), mode="L").save(path)
+
+
+def _replay_focus_point(replay: Replay, width: int, height: int, half_extent: float,
+                        start_ms: float = 0.0, end_ms: float | None = None,
+                        sample_count: int = 200, playfield_scale: float = 1.0) -> tuple[float, float]:
+    """Where the cursor spends most of its time (within [start_ms, end_ms] if
+    the render is clipped), as 0..1 canvas fractions -- used to aim the
+    depth-of-field sharp zone at the actual gameplay instead of always the
+    geometric center. Approximate on purpose (a single fixed point for the
+    whole video, not a per-frame moving one): the final-pass edge-blur filter
+    runs once over the already-concatenated output, so it can't track the
+    cursor frame by frame without re-encoding every frame."""
+    frames = replay.frames
+    if end_ms is not None:
+        frames = [f for f in frames if start_ms <= f.ms <= end_ms]
+    if not frames:
+        return (0.5, 0.5)
+    step = max(1, len(frames) // sample_count)
+    xs = [f.x for f in frames[::step]]
+    ys = [f.y for f in frames[::step]]
+    avg_x = sum(xs) / len(xs)
+    avg_y = sum(ys) / len(ys)
+    from .frame import playfield_geometry
+    (left, top), size, _portrait = playfield_geometry(width, height, playfield_scale)
+    # Scene coords span roughly +/-half_extent around the playfield center
+    # (see camera.py); Y grows upward in scene space, downward in canvas.
+    nx = 0.5 + avg_x / (2.0 * half_extent)
+    ny = 0.5 - avg_y / (2.0 * half_extent)
+    nx = min(1.0, max(0.0, nx))
+    ny = min(1.0, max(0.0, ny))
+    fx = (left + nx * size) / width
+    fy = (top + ny * size) / height
+    return (min(1.0, max(0.0, fx)), min(1.0, max(0.0, fy)))
+
+
 def default_worker_count() -> int:
     # Each worker is CPU-bound (Python drawing + its own single-threaded
     # ffmpeg encoder). Benchmarking on an 8-core/16-thread machine showed
@@ -479,6 +617,8 @@ def _render_segment(
     background_brightness: float,
     clip_start_ms: float,
     element_offsets: dict | None,
+    effects: dict | None,
+    playfield_scale: float,
 ):
     # Imported inside the worker so a 'spawn'ed process only pays for these
     # (and builds its GL-free Pillow context) once, not at pool-creation time.
@@ -494,20 +634,43 @@ def _render_segment(
     # the previous ones, so a segment's first frames would be less blurred
     # than the same frames rendered mid-segment -- a visible seam at segment
     # joins. Feed a few warm-up frames from just before the segment; the
-    # filter chain's trim drops them again after tmix.
-    warmup_times = [max(0.0, frame_times[0] - j * frame_dt_ms) for j in range(warmup_frames, 0, -1)]
+    # filter chain's trim drops them again after tmix. "Before" follows the
+    # *output* order (reversed renders play song time backwards).
+    step = frame_times[1] - frame_times[0] if len(frame_times) > 1 else frame_dt_ms
+    warmup_times = [max(0.0, frame_times[0] - j * step) for j in range(warmup_frames, 0, -1)]
     subframe_blur = motion_blur if motion_blur > 0 and motion_blur_mode == "subframe" else 0.0
 
     def _encode(args: dict) -> tuple[int, str]:
         """One full render+encode pass of this segment with one encoder
         configuration. Returns (ffmpeg exit code, its stderr text)."""
         ctx = build_context(width, height, cover_bytes, runtime_skin, playfield_extent=playfield_extent,
+                            playfield_scale=playfield_scale,
                             background_image_bytes=background_image_bytes,
                             background_brightness=background_brightness,
                             element_offsets=element_offsets)
         ctx.mods_label = mods_label
         timeline = Timeline(notes, results, replay, spawn_distance=spawn_distance,
                             approach_rate=approach_rate, ghost=ghost, chaos=chaos)
+        if effects:
+            ctx.dynamic_camera = effects.get("dynamic_camera", False)
+            ctx.beat_pulse = effects.get("beat_pulse", 0.0)
+            ctx.beat_envelope = effects.get("beat_envelope")
+            ctx.miss_particles = effects.get("miss_particles", False)
+            ctx.spawn_particles = effects.get("spawn_particles", False)
+            ctx.note_spawn_anim = effects.get("note_spawn_anim", False)
+            gh = effects.get("ghost")
+            if gh is not None:
+                # The ghost ran the same (mod-resolved) note list; its own
+                # hit results were matched in render_video.
+                ctx.ghost = {
+                    "replay": gh["replay"],
+                    "timeline": Timeline(notes, gh["results"], gh["replay"],
+                                         spawn_distance=spawn_distance,
+                                         approach_rate=approach_rate,
+                                         ghost=ghost, chaos=chaos),
+                    "color": gh.get("color", (255, 140, 60)),
+                    "comparison": gh.get("comparison", True),
+                }
 
         cmd = [
             _ffmpeg(), "-y", *_QUIET, *args["global"],
@@ -587,6 +750,7 @@ def _render_intro(
     cancel_cb,
     background_image: bytes | None = None,
     background_brightness: float = 0.4,
+    playfield_scale: float = 1.0,
 ) -> int:
     """Encodes the 2.5s intro card as its own segment file (placed first in
     the concat list). Runs in the main process -- it's only ~fps*2.5 frames
@@ -601,6 +765,7 @@ def _render_intro(
                                     hit_effects_enabled, note_colors, color_overrides,
                                     hud_overrides)
     ctx = build_context(width, height, map_.cover_bytes, runtime_skin, playfield_extent=playfield_extent,
+                        playfield_scale=playfield_scale,
                         background_image_bytes=background_image, background_brightness=background_brightness)
     card = np.asarray(draw_intro_card(ctx, map_.metadata, replay, map_.cover_bytes), dtype=np.float32)
 
@@ -717,6 +882,7 @@ def render_video(
     approach_rate: float = DEFAULT_APPROACH_RATE,
     skin: Skin | None = None,
     parallax_enabled: bool = True,
+    playfield_scale: float = 1.0,  # 0.1..1.0: shrinks the playfield square (and its whole HUD) around its own center
     trail_enabled: bool = True,
     note_colors: list[tuple[int, int, int]] | None = None,
     video_codec: str = "h264",  # "h264" | "hevc" | "av1"
@@ -738,6 +904,19 @@ def render_video(
     background_video: str | None = None,  # custom background video path (loops; wins over image)
     background_brightness: float = 0.4,  # brightness factor for custom backgrounds (1.0 = original, <1 darker, >1 brighter)
     element_offsets: dict | None = None,  # HUD element name -> (dx, dy) canvas fractions (see frame.MOVABLE_ELEMENTS)
+    reverse: bool = False,  # play the replay (and audio) backwards
+    dynamic_camera: bool = False,  # combo-driven zoom + shake on miss
+    beat_pulse: float = 0.0,  # 0..1: background brightness pulses with the music's onsets
+    miss_particles: bool = False,  # particle burst flying out of missed notes
+    spawn_particles: bool = False,  # particle burst flying out of notes as they spawn
+    note_spawn_anim: bool = False,  # notes pop/spin in as they spawn
+    ghost_replay: Replay | None = None,  # second replay overlaid on the same map (ghost race)
+    ghost_comparison: bool = True,  # show the side-by-side stats panel for the ghost race
+    ghost_color: tuple[int, int, int] = (255, 140, 60),
+    edge_blur: float = 0.0,  # 0..1: cinematic edge blur (DoF) applied in the final pass (mp4/webm)
+    pip_video: str | None = None,  # picture-in-picture overlay video (webcam etc.; mp4/webm only)
+    pip_corner: str = "bottom-right",  # top-left | top-right | bottom-left | bottom-right
+    pip_scale: float = 0.22,  # PiP width as a fraction of the canvas width
     progress_cb: ProgressCallback | None = None,
     cancel_cb: Callable[[], bool] | None = None,
 ) -> None:
@@ -798,8 +977,35 @@ def render_video(
     total_frames = max(1, int((end_ms - start_ms) / speed / 1000.0 * fps) + 1)
     frame_dt_ms = 1000.0 / fps * speed  # frame spacing in song time
     frame_times = [start_ms + i * frame_dt_ms for i in range(total_frames)]
+    if reverse:
+        frame_times.reverse()
 
     audio_ext = _detect_audio_ext(map_.audio_bytes)
+
+    # Optional per-frame effects, resolved once here and shipped to every
+    # segment worker (see frame.RenderContext for what each one draws).
+    beat_envelope = None
+    if beat_pulse > 0 and map_.audio_bytes:
+        beat_envelope = _onset_envelope(map_.audio_bytes, audio_ext)
+    ghost_data = None
+    if ghost_replay is not None:
+        ghost_data = {
+            "replay": ghost_replay,
+            "results": match_hits(notes, ghost_replay.frames),
+            "color": ghost_color,
+            "comparison": ghost_comparison,
+        }
+    effects = None
+    if dynamic_camera or beat_envelope or miss_particles or spawn_particles or note_spawn_anim or ghost_data:
+        effects = {
+            "dynamic_camera": dynamic_camera,
+            "beat_pulse": beat_pulse if beat_envelope else 0.0,
+            "beat_envelope": beat_envelope,
+            "miss_particles": miss_particles,
+            "spawn_particles": spawn_particles,
+            "note_spawn_anim": note_spawn_anim,
+            "ghost": ghost_data,
+        }
     num_workers = workers or default_worker_count()
     segments = _split_into_segments(frame_times, num_workers)
 
@@ -860,6 +1066,7 @@ def render_video(
                 background_dots_enabled, trail_scale, hit_effects_enabled, hud_overrides,
                 note_colors, color_overrides, playfield_extent, cancel_cb,
                 background_image=background_image, background_brightness=background_brightness,
+                playfield_scale=playfield_scale,
             )
             if intro_frames < 0:
                 return  # cancelled during the intro
@@ -891,7 +1098,7 @@ def render_video(
                     background_dots_enabled, trail_scale, hit_effects_enabled, hud_overrides,
                     motion_blur, motion_blur_mode, warmup_frames, frame_dt_ms,
                     background_image, background_video, background_brightness, start_ms,
-                    element_offsets,
+                    element_offsets, effects, playfield_scale,
                 ),
             )
             for i, seg in enumerate(segments)
@@ -961,6 +1168,11 @@ def render_video(
         container = os.path.splitext(output_path)[1].lower().lstrip(".") or "mp4"
 
         afilters = []
+        if reverse:
+            # The reversed render plays song time backwards; reverse the
+            # clip's audio to match (trimmed with -t below, so only the
+            # clip is buffered/reversed, before any speed change).
+            afilters.append("areverse")
         if abs(speed - 1.0) > 1e-3:
             # Speed the audio up/down the way the game's speed modifier
             # does: resampling (pitch shifts along with tempo), not a
@@ -978,7 +1190,94 @@ def render_video(
         audio_in = []
         if audio_bytes and container != "gif":
             audio_seek = ["-ss", f"{start_ms / 1000.0:.3f}"] if start_ms > 0 else []
+            if reverse:
+                audio_seek += ["-t", f"{(end_ms - start_ms) / 1000.0:.3f}"]
             audio_in = [*audio_seek, "-i", audio_path]
+
+        # Final-pass video filters (mp4/webm only): cinematic edge blur
+        # (depth-of-field) and/or a picture-in-picture overlay. Both need a
+        # re-encode of the already-composited stream, like the webm path.
+        filter_parts: list[str] = []
+        extra_inputs: list[str] = []
+        n_inputs = 1 + (1 if audio_bytes and container != "gif" else 0)
+        cur = "[0:v]"
+        if edge_blur > 0 and container in ("mp4", "webm"):
+            mask_path = os.path.join(td, "dof_mask.png")
+            focus = _replay_focus_point(replay, width, height, playfield_extent, start_ms, end_ms,
+                                        playfield_scale=playfield_scale)
+            _write_edge_blur_mask(mask_path, width, height, edge_blur, center=focus)
+            # -loop 1: the mask is a single image; loop it so alphamerge has
+            # a mask frame for every video frame (it ends with the video).
+            extra_inputs += ["-loop", "1", "-i", mask_path]
+            mask_idx = n_inputs
+            n_inputs += 1
+            lr = max(2, round(min(width, height) * (0.010 + 0.025 * min(1.0, edge_blur))))
+            filter_parts.append(
+                f"{cur}split[dofa][dofb];"
+                f"[dofb]boxblur=luma_radius={lr}:luma_power=2:"
+                f"chroma_radius={max(1, lr // 2)}:chroma_power=2[dofbl];"
+                f"[{mask_idx}:v]format=gray,scale={width}:{height}[dofm];"
+                f"[dofbl][dofm]alphamerge[dofov];"
+                f"[dofa][dofov]overlay=shortest=1[vdof]")
+            cur = "[vdof]"
+        if pip_video and container in ("mp4", "webm"):
+            extra_inputs += ["-i", pip_video]
+            pip_idx = n_inputs
+            n_inputs += 1
+            pw = max(2, int(width * max(0.05, min(0.5, pip_scale)))) // 2 * 2
+            margin = max(4, int(width * 0.015))
+            pos_x, pos_y = {
+                "top-left": (f"{margin}", f"{margin}"),
+                "top-right": (f"main_w-overlay_w-{margin}", f"{margin}"),
+                "bottom-left": (f"{margin}", f"main_h-overlay_h-{margin}"),
+                "bottom-right": (f"main_w-overlay_w-{margin}", f"main_h-overlay_h-{margin}"),
+            }.get(pip_corner, (f"main_w-overlay_w-{margin}", f"main_h-overlay_h-{margin}"))
+
+            pip_size = _probe_video_size(pip_video)
+            ph = max(2, round(pw * pip_size[1] / pip_size[0]) // 2 * 2) if pip_size else None
+            if ph:
+                # Rounded-corner mask + border ring, sized to the PiP's own
+                # aspect ratio, plus a short fade in/out so the overlay
+                # doesn't hard-cut in and out of the shot.
+                mask_path = os.path.join(td, "pip_mask.png")
+                border_path = os.path.join(td, "pip_border.png")
+                _write_pip_masks(mask_path, border_path, pw, ph)
+                extra_inputs += ["-loop", "1", "-i", mask_path, "-loop", "1", "-i", border_path]
+                mask_idx, border_idx = n_inputs, n_inputs + 1
+                n_inputs += 2
+
+                out_duration_s = _probe_duration_s(video_only_path)
+                fade_d = 0.3 if out_duration_s > 2 * 0.3 else 0.0
+                fade_mask, fade_border = "", ""
+                if fade_d:
+                    fade_out_st = max(0.0, out_duration_s - fade_d)
+                    # Mask: a plain (non-alpha) fade ramps its luma, which is
+                    # what alphamerge reads as the pip's alpha -- so this
+                    # fades the whole masked shape in/out, corners and all.
+                    fade_mask = f",fade=t=in:st=0:d={fade_d},fade=t=out:st={fade_out_st:.3f}:d={fade_d}"
+                    # Border: a real RGBA layer, so it needs alpha=1 to fade
+                    # its own transparency instead of fading its color to black.
+                    fade_border = (f",fade=t=in:st=0:d={fade_d}:alpha=1"
+                                  f",fade=t=out:st={fade_out_st:.3f}:d={fade_d}:alpha=1")
+                filter_parts.append(
+                    f"[{pip_idx}:v]scale={pw}:{ph}[pips];"
+                    f"[{mask_idx}:v]format=gray,scale={pw}:{ph}{fade_mask}[pipm];"
+                    f"[pips][pipm]alphamerge[pipmasked];"
+                    f"{cur}[pipmasked]overlay=shortest=1:x={pos_x}:y={pos_y}[vpip0];"
+                    f"[{border_idx}:v]format=rgba,scale={pw}:{ph}{fade_border}[pipb];"
+                    f"[vpip0][pipb]overlay=shortest=1:x={pos_x}:y={pos_y}[vpip]")
+            else:
+                # Couldn't probe the overlay's own size -- fall back to a
+                # plain rectangular overlay rather than failing the render.
+                # shortest=1: pip_video may run longer than the clip itself
+                # (e.g. a full webcam recording), which must not extend it.
+                filter_parts.append(f"[{pip_idx}:v]scale={pw}:-2[pipv];"
+                                    f"{cur}[pipv]overlay=shortest=1:x={pos_x}:y={pos_y}[vpip]")
+            cur = "[vpip]"
+        filter_complex = None
+        if filter_parts:
+            filter_parts.append(f"{cur}format=yuv420p[vout]")
+            filter_complex = ";".join(filter_parts)
 
         if container == "gif":
             # Two-pass palette in one filter graph; GIFs cap at ~30fps in
@@ -994,8 +1293,12 @@ def render_video(
         elif container == "webm":
             crf = {"fast": "36", "balanced": "32", "quality": "28"}[quality]
             cpu = {"fast": "5", "balanced": "3", "quality": "1"}[quality]
-            mux_cmd = [
-                _ffmpeg(), "-y", "-i", video_only_path, *audio_in,
+            mux_cmd = [_ffmpeg(), "-y", "-i", video_only_path, *audio_in, *extra_inputs]
+            if filter_complex:
+                mux_cmd += ["-filter_complex", filter_complex, "-map", "[vout]"]
+                if audio_in:
+                    mux_cmd += ["-map", "1:a"]
+            mux_cmd += [
                 "-c:v", "libvpx-vp9", "-crf", crf, "-b:v", "0",
                 "-row-mt", "1", "-cpu-used", cpu,
             ]
@@ -1005,7 +1308,19 @@ def render_video(
                 mux_cmd += ["-c:a", "libopus", "-b:a", audio_bitrate, "-shortest"]
             mux_cmd += [output_path]
         else:
-            mux_cmd = [_ffmpeg(), "-y", "-i", video_only_path, *audio_in, "-c:v", "copy"]
+            mux_cmd = [_ffmpeg(), "-y", "-i", video_only_path, *audio_in, *extra_inputs]
+            if filter_complex:
+                # The composited stream must be re-encoded to apply the
+                # filters; reuse the chosen codec's software encoder.
+                enc_name, _, _, enc_quality = ENCODERS[(video_codec, "none")]
+                mux_cmd += ["-filter_complex", filter_complex, "-map", "[vout]",
+                            "-c:v", enc_name, *enc_quality[quality]]
+                if video_codec == "hevc":
+                    mux_cmd += ["-tag:v", "hvc1"]
+                if audio_in:
+                    mux_cmd += ["-map", "1:a"]
+            else:
+                mux_cmd += ["-c:v", "copy"]
             if audio_in:
                 if afilters:
                     mux_cmd += ["-filter:a", ",".join(afilters)]

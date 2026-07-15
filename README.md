@@ -17,9 +17,30 @@ The project includes:
   automatically via Pillow), with a brightness control (darken or brighten)
 - auto-highlight: picks the best clip window (densest section, near-deaths,
   the fail moment) automatically
-- an optional osu!-style hit-error (timing) bar
+- an optional osu!-style hit-error (timing) bar and a live stats card
+  (rolling UR, mean offset, timing histogram)
 - movable HUD: drag any element (title, panels, combo, health bar, timing
-  bar) on the GUI preview to reposition it, or use `--move` on the CLI
+  bar, stats, versus panel) on the GUI preview to reposition it, or use
+  `--move` on the CLI; right-click an element to remove it from the video
+  (`--hide` on the CLI), including the playfield border (`--no-border`)
+- removable skin images: right-click a skin's decorative image (mascots,
+  side art) on the preview to take it out of the video (`--hide-assets`
+  on the CLI) while keeping the rest of the skin
+- render effects: dynamic camera (combo zoom + miss shake), beat pulse
+  (background reacts to the music), miss particles, note spawn pop-in,
+  cinematic edge blur (depth of field), and reverse playback
+- ghost race: overlay a second replay of the same map (its cursor in a
+  distinct color plus a side-by-side live stats panel)
+- picture-in-picture overlay for a webcam recording
+- montage: auto-picks the best moment of several replays and joins them
+  into one highlight reel with styled transitions (GUI queue button or
+  `--montage` on the CLI)
+- shareable preset bundles (`.rhrp`): all render settings plus the skin and
+  colorset files in one file (GUI Export/Import, CLI `--preset`)
+- post-render webhook (Discord-compatible; attaches the video when small
+  enough)
+- pre-render time estimate in the GUI, and live elapsed/remaining during
+  the render
 - visual overrides for HUD, skin, and colorset
 - an `.sspm` → `.rhm` converter (`--convert`)
 
@@ -90,8 +111,14 @@ The app opens a large preview on the left and controls on the right. You can:
 - mark clip start and end points (or hit **✨ Auto** to auto-pick a highlight)
 - drag HUD elements around on the preview to customize the layout
   (double-click one to reset it; **↺ Layout** resets everything)
+- right-click a HUD element on the preview to hide it (re-check it in
+  Options → HUD elements to bring it back), or right-click one of the
+  skin's decorative images (mascots, side art) to remove it from the
+  video — right-click again anywhere to show hidden images
 - render a short preview around the current position
 - queue multiple `.rhr` files and render them sequentially
+- turn the queue into a highlight reel with the **🎬 Montage** button (the
+  best ~15s of each replay, joined with the chosen transition)
 - watch a folder so new replays are queued automatically (Options → Optional
   resources)
 
@@ -104,13 +131,18 @@ The options dialog (`Ctrl+O`) contains the main settings:
 
 - **Output**: final path — the extension picks the container (`.mp4`, `.webm`
   or `.gif`)
-- **Render settings**: named presets, resolution, FPS, quality, codec,
-  hardware acceleration, audio bitrate, spawn distance, approach rate, trail
-  size, motion blur, parallax, background dots, hit effects, intro, and a
-  custom background image/video/gif with a brightness control
+- **Render settings**: named presets (plus Export/Import of shareable
+  `.rhrp` bundles), resolution, FPS, quality, codec, hardware acceleration,
+  audio bitrate, spawn distance, approach rate, trail size, motion blur,
+  parallax, background dots, hit effects, intro, a custom background
+  image/video/gif with a brightness control, render effects (dynamic
+  camera, beat pulse, miss particles, note spawn pop, reverse), edge blur
+  (DoF), and a picture-in-picture overlay video
 - **HUD elements**: show or hide title, progress, combo, grade, accuracy,
-  score, points, misses, notes, health, speed, and other HUD items
-- **Optional resources**: `.rhs` skin, `.txt` colorset, game directory
+  score, points, misses, notes, health, speed, timing bar, live stats, the
+  playfield border, and other HUD items
+- **Optional resources**: `.rhs` skin, `.txt` colorset, game directory,
+  watch folder, ghost race replay, and a post-render webhook URL
 - **Colors**: built-in presets, user-saved presets, and the colorsets
   auto-discovered from the Rhythia install (shown as "Rhythia: …" — a few,
   like the game's default, are bundled with the app so no install is needed)
@@ -175,8 +207,25 @@ Useful CLI options:
 - `--blur-intensity PCT`
 - `--clip START-END` or `--clip auto[:SECONDS]` (auto-picked highlight)
 - `--intro`
-- `--hide title,progress,combo,...|all`
+- `--hide title,progress,combo,border,...|all`
+- `--no-border` (borderless playfield, same as `--hide border`)
+- `--hide-assets 1,2|all` (remove the skin's decorative background images;
+  `--list-assets` shows each one's number and position)
 - `--timing-bar` (osu!-style hit-error bar)
+- `--stats-overlay` (live UR/mean/timing-histogram card)
+- `--reverse` (plays the replay and audio backwards)
+- `--dynamic-camera` / `--beat-pulse [PCT]` / `--miss-particles` /
+  `--note-anim` (render effects)
+- `--ghost-replay other.rhr` (ghost race overlay; `--no-ghost-panel` hides
+  the versus stats)
+- `--edge-blur PCT` (cinematic depth-of-field edge blur; mp4/webm)
+- `--pip webcam.mp4` / `--pip-corner` / `--pip-scale PCT` (picture-in-picture)
+- `--montage a.rhr b.rhr c.rhr --transition wipeleft` (highlight reel; the
+  best moment of each replay, auto-detected maps, joined with transitions;
+  `--clip auto:SECONDS` sets each moment's length)
+- `--preset my-look.rhrp` (apply a preset bundle exported from the GUI;
+  explicit flags still win)
+- `--webhook URL` (POST the finished video to a Discord-style webhook)
 - `--move ELEM=DX,DY` — move a HUD element by percent of the canvas
   (repeatable; elements: title, combo, left_panel, right_panel, health,
   timing; e.g. `--move health=0,5 --move title=0,80`)

@@ -75,6 +75,9 @@ class NoteRenderState:
     # Scene-cell offset from the note's lane (CHAOS mod wobble).
     offset_x: float = 0.0
     offset_y: float = 0.0
+    # Approach progress: 0 at spawn, 1 at the hit moment (1 for hit/miss
+    # states) -- drives the optional spawn pop-in animation in frame.py.
+    progress: float = 1.0
 
 
 @dataclass
@@ -198,7 +201,7 @@ class Timeline:
 
             return NoteRenderState(
                 note=note, depth=depth, opacity=opacity, kind="approaching",
-                offset_x=offset_x, offset_y=offset_y,
+                offset_x=offset_x, offset_y=offset_y, progress=progress,
             )
 
         # Past the hit moment: a hit note disappears instantly (the game

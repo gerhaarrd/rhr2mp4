@@ -143,6 +143,17 @@ QLabel#fieldLabel {
     font-weight: 500;
 }
 
+QLabel#subsectionLabel {
+    color: rgba(150, 170, 235, 0.6);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    border-top: 1px solid rgba(120, 140, 255, 0.14);
+    padding-top: 10px;
+    margin-top: 2px;
+}
+
 QLabel#metaLabel {
     color: rgba(150, 170, 235, 0.85);
     font-size: 12px;

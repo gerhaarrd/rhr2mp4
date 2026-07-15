@@ -16,6 +16,11 @@ from .notemesh import extract_accent_color, rasterize_note_mask
 
 DEFAULT_NOTE_MASK_SIZE = 256
 
+# Playback rate for animated note skins (note_masks with more than one
+# frame). Fixed rather than skin-configurable -- the .rhs config format is
+# owned by the game client, which has no such field (see formats/rhs.py).
+NOTE_ANIMATION_FPS = 8.0
+
 
 @dataclass
 class RuntimeBackgroundLayer:
@@ -28,11 +33,16 @@ class RuntimeBackgroundLayer:
     flip_horizontal: bool
     tint_rgb: tuple[int, int, int]
     tint_opacity: float
+    name: str = ""  # see formats.rhs.BackgroundLayer.name
 
 
 @dataclass
 class RuntimeSkin:
     note_mask: Image.Image
+    # All rasterized note-mesh frames (see formats.rhs.Skin.note_mesh_frames);
+    # note_mask above is always note_masks[0]. len() > 1 means frame.py cycles
+    # through them at NOTE_ANIMATION_FPS instead of drawing a static shape.
+    note_masks: list[Image.Image] = field(default_factory=list)
     # The official visualizer draws plain white notes when no colorset is
     # active.
     note_color: tuple[int, int, int] = (255, 255, 255)
@@ -58,8 +68,14 @@ class RuntimeSkin:
     border_stroke_bbox: tuple[int, int, int, int] | None = None
     border_color: tuple[int, int, int] = (255, 255, 255)
     border_opacity: float = 0.3  # official visualizer: rgba(255,255,255,0.3)
+    # False hides the playfield frame entirely (both border-skin images and
+    # the default rounded rectangle) -- GUI HUD card / --hide border.
+    border_enabled: bool = True
 
     background_layers: list[RuntimeBackgroundLayer] = field(default_factory=list)
+    # Layer names the user removed from the screen (GUI right-click on the
+    # preview / --hide-assets): _make_background skips these when compositing.
+    hidden_layer_names: tuple = ()
     background_rgb: tuple[int, int, int] | None = None  # None = keep the built-in gradient
     background_accent_rgb: tuple[int, int, int] = (0, 0, 0)
     background_accent_from_hit_note: bool = False
@@ -146,6 +162,9 @@ class RuntimeSkin:
     # how early/late they were. An app render option, not a game HUD element,
     # so it defaults off.
     hit_error_bar_enabled: bool = False
+    # Live stats card (rolling UR, mean offset, timing histogram) -- an app
+    # render option like the timing bar, off by default.
+    live_stats_enabled: bool = False
     health_bar_color: tuple[int, int, int] = (211, 255, 151)  # game default light green
     health_bar_alpha: float = 1.0
     fail_vignette_opacity: float = 0.0
@@ -260,41 +279,52 @@ def _border_stroke_bbox(img: Image.Image) -> tuple[int, int, int, int]:
     )
 
 
+def _open_rgba(data: bytes) -> Image.Image | None:
+    """Decodes skin image bytes to RGBA, or None when Pillow can't identify
+    them -- a skin with one broken image should lose that image, not the
+    whole render."""
+    try:
+        return Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception:
+        return None
+
+
 def resolve(skin: Skin | None) -> RuntimeSkin:
     cursor_mask = _solid_circle_mask(size=128)
 
     if skin is None:
         # Bare RuntimeSkin defaults already mirror the official visualizer
         # (white notes, thin 30% border, no grid lines / tunnel effects).
+        default_mask = _default_note_ring_mask()
         return RuntimeSkin(
-            note_mask=_default_note_ring_mask(),
+            note_mask=default_mask,
+            note_masks=[default_mask],
             cursor_mask=cursor_mask,
         )
 
-    note_mask = (
-        rasterize_note_mask(skin.note_obj_bytes)
-        if skin.note_obj_bytes
-        else _default_note_ring_mask()
-    )
+    mesh_frames = skin.note_mesh_frames or ([skin.note_obj_bytes] if skin.note_obj_bytes else [])
+    note_masks = [rasterize_note_mask(b) for b in mesh_frames] if mesh_frames else [_default_note_ring_mask()]
+    note_mask = note_masks[0]
 
     border_image = None
     border_stroke_bbox = None
     note_color = (255, 255, 255)
     if skin.border_image_bytes:
-        border_image = Image.open(io.BytesIO(skin.border_image_bytes)).convert("RGBA")
-        border_stroke_bbox = _border_stroke_bbox(border_image)
-        note_color = extract_accent_color(border_image, default=note_color)
+        border_image = _open_rgba(skin.border_image_bytes)
+        if border_image is not None:
+            border_stroke_bbox = _border_stroke_bbox(border_image)
+            note_color = extract_accent_color(border_image, default=note_color)
 
     cursor_image = None
     if skin.cursor_image_bytes:
-        cursor_image = Image.open(io.BytesIO(skin.cursor_image_bytes)).convert("RGBA")
+        cursor_image = _open_rgba(skin.cursor_image_bytes)
     cursor_trail_image = None
     if skin.cursor_trail_image_bytes:
-        cursor_trail_image = Image.open(io.BytesIO(skin.cursor_trail_image_bytes)).convert("RGBA")
+        cursor_trail_image = _open_rgba(skin.cursor_trail_image_bytes)
 
     background_layers = [
         RuntimeBackgroundLayer(
-            image=Image.open(io.BytesIO(bl.image_bytes)).convert("RGBA"),
+            image=img,
             center_x=bl.center_x,
             center_y=bl.center_y,
             scale_x=bl.scale_x,
@@ -303,12 +333,15 @@ def resolve(skin: Skin | None) -> RuntimeSkin:
             flip_horizontal=bl.flip_horizontal,
             tint_rgb=bl.tint_rgb,
             tint_opacity=bl.tint_opacity,
+            name=bl.name or str(i + 1),
         )
-        for bl in skin.background_layers
+        for i, bl in enumerate(skin.background_layers)
+        if (img := _open_rgba(bl.image_bytes)) is not None
     ]
 
     return RuntimeSkin(
         note_mask=note_mask,
+        note_masks=note_masks,
         note_color=note_color,
         note_colors=list(skin.note_colors),
         cursor_mask=cursor_mask,

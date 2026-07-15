@@ -21,7 +21,7 @@ from ..formats.rhm import MapMetadata
 from ..formats.rhr import Replay
 from ..sim.timeline import TimelineState
 from .camera import Camera
-from .skin_runtime import RuntimeSkin
+from .skin_runtime import NOTE_ANIMATION_FPS, RuntimeSkin
 from .skin_runtime import resolve as resolve_skin
 
 # Bundled with the package (rhr2mp4/assets) so frozen Windows/Linux builds
@@ -109,18 +109,55 @@ class RenderContext:
     # canvas width/height. Shared by reference with the GUI's drag editor,
     # so mutating the dict moves elements without rebuilding the context.
     element_offsets: dict | None = None
+    # Optional render effects, all opt-in (set by video.py's segment workers
+    # from render_video kwargs; previews leave them at their defaults):
+    # zoom builds with the combo and the frame shakes briefly on a miss.
+    dynamic_camera: bool = False
+    # 0..1: the background brightness pulses with the music's onsets.
+    beat_pulse: float = 0.0
+    # (window_ms, [strength 0..1 per window]) onset envelope in song time.
+    beat_envelope: tuple | None = None
+    # Particle burst flying out of missed notes.
+    miss_particles: bool = False
+    # Particle burst flying out of notes as they spawn.
+    spawn_particles: bool = False
+    # Notes pop/spin in as they spawn instead of just fading in.
+    note_spawn_anim: bool = False
+    # Ghost race: {"replay", "timeline", "color", "comparison"} for a second
+    # replay overlaid on the same map (cursor + trail + versus panel).
+    ghost: dict | None = None
 
 
 # HUD elements whose position the user can adjust (GUI drag editor and the
 # CLI --move flag). Keys of RenderContext.element_offsets.
-MOVABLE_ELEMENTS = ("title", "combo", "left_panel", "right_panel", "health", "timing")
+MOVABLE_ELEMENTS = ("title", "combo", "left_panel", "right_panel", "health", "timing",
+                    "stats", "versus")
 
 
-def _element_offset(ctx: "RenderContext", name: str) -> tuple[int, int]:
+def _ui_parallax_offset(ctx: "RenderContext", cursor_scene: tuple[float, float]) -> tuple[float, float]:
+    """Cursor-driven sway for the HUD (title/combo/panels/health/timing/
+    stats/versus), so the whole UI reads as part of the same camera instead
+    of only the approaching notes swaying (see Camera.project's `sway`).
+    Deliberately smaller and clamped -- the note sway is a per-note, fairly
+    large offset that only ever applies to one note at a time and fades to
+    0 at the hit plane; a whole panel sitting off by that much all the time
+    would be distracting, so this scales down and caps the movement."""
+    parallax = ctx.camera.parallax
+    if not parallax:
+        return 0.0, 0.0
+    max_shift = ctx.playfield_size * 0.05
+    sx = cursor_scene[0] * parallax * ctx.playfield_size * 0.02
+    sy = cursor_scene[1] * parallax * ctx.playfield_size * 0.02
+    return max(-max_shift, min(max_shift, sx)), max(-max_shift, min(max_shift, sy))
+
+
+def _element_offset(ctx: "RenderContext", name: str,
+                    cursor_scene: tuple[float, float] = (0.0, 0.0)) -> tuple[int, int]:
     off = (ctx.element_offsets or {}).get(name)
-    if not off:
-        return 0, 0
-    return round(off[0] * ctx.width), round(off[1] * ctx.height)
+    dx = off[0] * ctx.width if off else 0.0
+    dy = off[1] * ctx.height if off else 0.0
+    sx, sy = _ui_parallax_offset(ctx, cursor_scene)
+    return round(dx + sx), round(dy + sy)
 
 
 def element_rects(ctx: "RenderContext") -> dict[str, tuple[float, float, float, float]]:
@@ -136,6 +173,11 @@ def element_rects(ctx: "RenderContext") -> dict[str, tuple[float, float, float, 
         "title": (ox, h * 0.012, size, h * 0.088),
         "health": (ox, oy + size + h * 0.018, size, h * 0.055),
         "timing": (ox + size * 0.20, oy + size - size * 0.09, size * 0.60, size * 0.07),
+        # Live stats card (see _draw_live_stats) and the ghost-race versus
+        # panel (see _draw_versus_panel); both drawn only when enabled but
+        # always hit-testable so the GUI's drag editor can grab them.
+        "stats": (w * 0.02, oy + size - size * 0.30, size * 0.30, size * 0.30),
+        "versus": (ox + size * 0.15, h * 0.100, size * 0.70, h * 0.075),
     }
     combo_cy = oy + size * (skin.combo_text_vertical_position_percent / 100.0)
     rects["combo"] = (ox + size * 0.34, combo_cy - ctx.font_combo.size * 0.8,
@@ -186,6 +228,16 @@ def apply_brightness(img: Image.Image, factor: float) -> Image.Image:
     return Image.eval(img, lambda v: min(255, int(v * factor)))
 
 
+def _open_image_bytes(data: bytes) -> Image.Image | None:
+    """Decodes raw image-file bytes, or None when Pillow can't identify
+    them (bad cover art inside a downloaded map, an exotic background
+    format) -- callers skip the asset instead of killing the whole render."""
+    try:
+        return Image.open(io.BytesIO(data))
+    except Exception:
+        return None
+
+
 def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: RuntimeSkin,
                      background_image_bytes: bytes | None = None,
                      background_brightness: float = 0.4) -> tuple[Image.Image, Image.Image | None]:
@@ -205,11 +257,16 @@ def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: R
         # User-chosen background image: fills the canvas (darkened by
         # default for legibility) but keeps any skin decoration layers on
         # top of it.
-        custom = Image.open(io.BytesIO(background_image_bytes)).convert("RGB")
-        bg = apply_brightness(fit_cover(custom, width, height), background_brightness).convert("RGBA")
+        custom = _open_image_bytes(background_image_bytes)
+        if custom is not None:
+            custom = custom.convert("RGB")
+            bg = apply_brightness(fit_cover(custom, width, height), background_brightness).convert("RGBA")
 
     if skin.background_layers:
+        hidden = set(skin.hidden_layer_names or ())
         for layer in skin.background_layers:
+            if layer.name in hidden:
+                continue
             img = layer.image
             if layer.flip_horizontal:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
@@ -236,35 +293,76 @@ def _make_background(width: int, height: int, cover_bytes: bytes | None, skin: R
 
     cover_thumb = None
     if cover_bytes:
-        cover = Image.open(io.BytesIO(cover_bytes)).convert("RGB")
-        thumb_size = int(min(width, height) * 0.1)
-        cover_thumb = cover.resize((thumb_size, thumb_size))
+        cover = _open_image_bytes(cover_bytes)
+        if cover is not None:
+            thumb_size = int(min(width, height) * 0.1)
+            cover_thumb = cover.convert("RGB").resize((thumb_size, thumb_size))
 
     return bg.convert("RGB"), cover_thumb
 
 
+def background_layer_rects(skin: RuntimeSkin, width: int, height: int) -> dict[str, tuple[float, float, float, float]]:
+    """Canvas-space bounding boxes (x, y, w, h) of the skin's decorative
+    background images, keyed by layer name -- the GUI's right-click "hide
+    skin image" hit-tests these. Mirrors _make_background's fit-in-box
+    placement (rotation ignored: the box is approximate, like element_rects)."""
+    rects: dict[str, tuple[float, float, float, float]] = {}
+    for layer in skin.background_layers:
+        img = layer.image
+        box_w = max(1, layer.scale_x * width)
+        box_h = max(1, layer.scale_y * height)
+        fit_scale = min(box_w / img.width, box_h / img.height)
+        w = max(1, int(img.width * fit_scale))
+        h = max(1, int(img.height * fit_scale))
+        rects[layer.name] = (layer.center_x * width - w / 2,
+                             layer.center_y * height - h / 2, w, h)
+    return rects
+
+
+def playfield_geometry(width: int, height: int, scale: float = 1.0) -> tuple[tuple[int, int], int, bool]:
+    """Canvas position/size of the playfield square: (origin, size, portrait).
+    Proportions measured from a real gameplay recording at 1080p (see
+    build_context). Factored out so callers that only need projection math
+    -- not a full RenderContext -- can share this without paying for fonts,
+    background generation, or texture prep (e.g. video.py's depth-of-field
+    focal-point estimate).
+
+    `scale` (0..1, default 1.0 = the measured reference size) shrinks the
+    square around its own center -- the whole HUD is laid out as fractions
+    of playfield_origin/playfield_size, so this alone is enough to "zoom
+    out" everything (panels, combo, health/timing bars) and open up breathing
+    room around it, without touching any of that per-element math."""
+    portrait = width < height
+    if portrait:
+        base_size = int(width * 0.82)
+        base_top = int(height * 0.16)
+    else:
+        base_size = int(height * 0.575)
+        base_top = int(height * 0.23)
+    scale = max(0.1, min(1.0, scale))
+    playfield_size = max(1, round(base_size * scale))
+    playfield_top = base_top + (base_size - playfield_size) // 2
+    playfield_left = (width - playfield_size) // 2
+    return (playfield_left, playfield_top), playfield_size, portrait
+
+
 def build_context(width: int, height: int, cover_bytes: bytes | None, skin: RuntimeSkin | None = None,
                   playfield_extent: float = 1.5,
+                  playfield_scale: float = 1.0,
                   background_image_bytes: bytes | None = None,
                   background_brightness: float = 0.4,
                   element_offsets: dict | None = None) -> RenderContext:
     if skin is None:
         skin = resolve_skin(None)
 
-    # Proportions measured from a real gameplay recording at 1080p: the
-    # playfield border spans ~620px (57.5% of height) with its top at ~23%,
-    # leaving room above for title/time/progress bar (and skin mascots that
-    # hang outside the border). Portrait (9:16) canvases instead size the
-    # playfield off the width and move the stat panels below it (see
-    # _draw_side_panels).
-    portrait = width < height
-    if portrait:
-        playfield_size = int(width * 0.82)
-        playfield_top = int(height * 0.16)
-    else:
-        playfield_size = int(height * 0.575)
-        playfield_top = int(height * 0.23)
-    playfield_left = (width - playfield_size) // 2
+    # Playfield border spans ~620px (57.5% of height), leaving room above for
+    # title/time/progress bar (and skin mascots that hang outside the
+    # border). Portrait (9:16) canvases instead size the playfield off the
+    # width and move the stat panels below it (see _draw_side_panels).
+    # playfield_scale (<1.0) shrinks it further, centered in the same spot,
+    # for players who find the default size too dominant on screen.
+    (playfield_left, playfield_top), playfield_size, portrait = playfield_geometry(
+        width, height, playfield_scale)
 
     camera = Camera(width=playfield_size, height=playfield_size, fov_deg=skin.camera_fov,
                     parallax=skin.parallax, half_extent=playfield_extent)
@@ -395,12 +493,30 @@ def _draw_default_border(draw, ox, oy, size, color, opacity):
     )
 
 
+def _envelope_at(envelope: tuple, t_ms: float) -> float:
+    """Onset strength (0..1) at a song time, from the (window_ms, values)
+    envelope computed in video.py."""
+    window_ms, values = envelope
+    if not values or window_ms <= 0:
+        return 0.0
+    idx = int(t_ms / window_ms)
+    if idx < 0 or idx >= len(values):
+        return 0.0
+    return values[idx]
+
+
 def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, replay: Replay) -> Image.Image:
     if ctx.background_provider is not None:
         bg = ctx.background_provider(state.time_ms)
         img = bg.convert("RGBA") if bg is not None else ctx.base_background.copy()
     else:
         img = ctx.base_background.copy()
+
+    if ctx.beat_pulse > 0 and ctx.beat_envelope is not None:
+        # Brightness-only pulse (factor >= 1, so the RGBA alpha stays 255).
+        env = _envelope_at(ctx.beat_envelope, state.time_ms)
+        if env > 0.02:
+            img = apply_brightness(img, 1.0 + 0.35 * ctx.beat_pulse * env)
     overlay = Image.new("RGBA", (ctx.width, ctx.height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay, "RGBA")
 
@@ -423,8 +539,14 @@ def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, 
     _draw_background_effects(ctx, playfield_layer, playfield_draw, state, ox, oy, size)
     _draw_playfield_grid(ctx, playfield_layer, playfield_draw, cursor_scene, ox, oy)
     _draw_notes(ctx, playfield_layer, state, cursor_scene, ox, oy)
+    if ctx.spawn_particles:
+        _draw_spawn_particles(ctx, playfield_draw, state, cursor_scene, ox, oy)
     if skin.hit_effects_enabled:
         _draw_hit_effects(ctx, playfield_draw, state, cursor_scene, ox, oy)
+    if ctx.miss_particles:
+        _draw_miss_particles(ctx, playfield_draw, state, cursor_scene, ox, oy)
+    if ctx.ghost is not None:
+        _draw_ghost_cursor(ctx, playfield_draw, state.time_ms, cursor_scene, ox, oy)
     _draw_cursor_trail(ctx, playfield_layer, playfield_draw, replay, state.time_ms, cursor_scene, ox, oy)
     _draw_cursor(ctx, playfield_layer, cursor_scene, ox, oy)
     _draw_miss_effect(ctx, playfield_layer, state, ox, oy, size)
@@ -432,21 +554,26 @@ def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, 
     playfield_layer.putalpha(ImageChops.multiply(playfield_layer.getchannel("A"), ctx.playfield_clip_mask))
     overlay.alpha_composite(playfield_layer)
 
-    if ctx.border_resized is not None:
-        # border_origin may be negative (the image's margins/mascots hang
-        # outside the playfield square, possibly past the canvas edge) and
-        # alpha_composite rejects negative dest coords, so shift the
-        # overflow into the `source` crop instead.
-        bx, by = ctx.border_origin
-        overlay.alpha_composite(ctx.border_resized, (max(0, bx), max(0, by)), (max(0, -bx), max(0, -by)))
-    else:
-        _draw_default_border(draw, ox, oy, size, skin.border_color, skin.border_opacity)
+    if skin.border_enabled:
+        if ctx.border_resized is not None:
+            # border_origin may be negative (the image's margins/mascots hang
+            # outside the playfield square, possibly past the canvas edge) and
+            # alpha_composite rejects negative dest coords, so shift the
+            # overflow into the `source` crop instead.
+            bx, by = ctx.border_origin
+            overlay.alpha_composite(ctx.border_resized, (max(0, bx), max(0, by)), (max(0, -bx), max(0, -by)))
+        else:
+            _draw_default_border(draw, ox, oy, size, skin.border_color, skin.border_opacity)
 
     _draw_combo(ctx, overlay, draw, state, ox, oy, size)
     _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size)
     _draw_health_bar(ctx, draw, state, replay, ox, oy, size)
     if skin.hit_error_bar_enabled:
         _draw_hit_error_bar(ctx, draw, state, ox, oy, size)
+    if skin.live_stats_enabled:
+        _draw_live_stats(ctx, overlay, draw, state, ox, oy, size)
+    if ctx.ghost is not None and ctx.ghost.get("comparison"):
+        _draw_versus_panel(ctx, overlay, draw, state, replay, ox, oy, size)
 
     if skin.song_info_enabled:
         _draw_title_block(ctx, draw, map_meta, replay, state, ox, oy, size)
@@ -454,7 +581,10 @@ def draw_frame(ctx: RenderContext, state: TimelineState, map_meta: MapMetadata, 
     _draw_fail_vignette(ctx, overlay, state)
 
     img.alpha_composite(overlay)  # in place: skips one full-frame allocation
-    return img.convert("RGB")
+    out = img.convert("RGB")
+    if ctx.dynamic_camera:
+        out = _apply_dynamic_camera(ctx, state, out)
+    return out
 
 
 def draw_frame_blurred(ctx: RenderContext, timeline, map_meta: MapMetadata, replay: Replay,
@@ -519,8 +649,9 @@ def draw_intro_card(ctx: RenderContext, map_meta: MapMetadata, replay: Replay,
     # Cover art, center-cropped square with rounded corners.
     cover_size = int(ref * 0.34)
     cover_y = int(h * 0.24)
-    if cover_bytes:
-        cover = Image.open(io.BytesIO(cover_bytes)).convert("RGB")
+    cover = _open_image_bytes(cover_bytes) if cover_bytes else None
+    if cover is not None:
+        cover = cover.convert("RGB")
         side = min(cover.size)
         cover = cover.crop((
             (cover.width - side) // 2, (cover.height - side) // 2,
@@ -684,6 +815,10 @@ def _draw_playfield_grid(ctx, overlay, draw, cursor_scene, ox, oy):
 
 def _draw_notes(ctx, overlay, state, cursor_scene, ox, oy):
     skin = ctx.skin
+    note_mask = skin.note_mask
+    if len(skin.note_masks) > 1:
+        frame_idx = int(state.time_ms / 1000.0 * NOTE_ANIMATION_FPS) % len(skin.note_masks)
+        note_mask = skin.note_masks[frame_idx]
     notes_sorted = sorted(state.notes, key=lambda ns: -ns.depth)
     for ns in notes_sorted:
         sx, sy = note_to_scene(ns.note.x, ns.note.y)
@@ -708,9 +843,60 @@ def _draw_notes(ctx, overlay, state, cursor_scene, ox, oy):
         if opacity <= 0 or r <= 0:
             continue
 
-        sprite = _tinted_sprite(skin.note_mask, r * 2.0, color, opacity)
+        # Optional spawn animation: over the first third of the approach the
+        # note grows into place while un-spinning (alternating direction per
+        # note), landing exactly on the normal size/orientation so the rest
+        # of the approach is untouched.
+        rotation = 0.0
+        if ctx.note_spawn_anim and ns.kind == "approaching" and ns.progress < 0.35:
+            s = max(0.0, ns.progress / 0.35)
+            r *= 0.55 + 0.45 * s
+            rotation = (1.0 - s) * 75.0 * (1 if ns.index % 2 else -1)
+
+        sprite = _tinted_sprite(note_mask, r * 2.0, color, opacity)
         if sprite is not None:
+            if rotation:
+                sprite = sprite.rotate(rotation, resample=Image.BILINEAR, expand=True)
             overlay.alpha_composite(sprite, (int(cx - sprite.width / 2), int(cy - sprite.height / 2)))
+
+
+def _draw_spawn_particles(ctx, draw, state, cursor_scene, ox, oy):
+    """Particle burst flying out of a note as it spawns (opt-in): small
+    fragments scatter radially from the note's lane and fade during the
+    first slice of its approach. Deterministic per note index, mirroring
+    the miss-particle burst below so both read as the same visual family."""
+    skin = ctx.skin
+    window = 0.18  # fraction of the approach the burst lasts
+    for ns in state.notes:
+        if ns.kind != "approaching" or ns.progress >= window:
+            continue
+        sx, sy = note_to_scene(ns.note.x, ns.note.y)
+        sx += ns.offset_x
+        sy += ns.offset_y
+        px, py, scale = ctx.camera.project(sx, sy, ns.depth, cursor_scene)
+        max_r = ctx.playfield_size * (NOTE_CELL_FILL / (ctx.camera.half_extent * 2.0)) / 2.0
+        r = max_r * scale * skin.note_scale
+        if r <= 1:
+            continue
+        cx, cy = ox + px, oy + py
+        t = max(0.0, ns.progress / window)
+        alpha = int(220 * (1.0 - t) ** 1.2)
+        if alpha <= 2:
+            continue
+        if skin.note_colors:
+            color = skin.note_colors[ns.index % len(skin.note_colors)]
+        else:
+            color = skin.note_color
+
+        seed = ns.index * 1.734121
+        n = 8
+        for k in range(n):
+            angle = seed + k * (2.0 * math.pi / n)
+            dist = r * (0.3 + 1.6 * t)
+            fx = cx + math.cos(angle) * dist
+            fy = cy + math.sin(angle) * dist
+            ps = max(1.0, r * 0.11 * (1.0 - t))
+            draw.ellipse([fx - ps, fy - ps, fx + ps, fy + ps], fill=(*color, alpha))
 
 
 def _draw_hit_effects(ctx, draw, state, cursor_scene, ox, oy):
@@ -759,6 +945,197 @@ def _draw_hit_effects(ctx, draw, state, cursor_scene, ox, oy):
                     radius=frag * 0.4,
                     fill=(*color, alpha),
                 )
+
+
+def _draw_miss_particles(ctx, draw, state, cursor_scene, ox, oy):
+    """Extra particle burst flying out of a missed note (opt-in, on top of
+    the red vignette pulse): small fragments scatter radially from the
+    note's lane while it fades. Deterministic per note index, so segment
+    workers and re-renders always draw the same burst."""
+    skin = ctx.skin
+    for ns in state.notes:
+        if ns.kind != "miss":
+            continue
+        sx, sy = note_to_scene(ns.note.x, ns.note.y)
+        px, py, scale = ctx.camera.project(sx, sy, 0.0, cursor_scene)
+        max_r = ctx.playfield_size * (NOTE_CELL_FILL / (ctx.camera.half_extent * 2.0)) / 2.0
+        r = max_r * scale * skin.note_scale
+        if r <= 1:
+            continue
+        cx, cy = ox + px, oy + py
+        burst = ns.burst
+        alpha = int(235 * (1.0 - burst) ** 1.2)
+        if alpha <= 2:
+            continue
+        if skin.note_colors:
+            color = skin.note_colors[ns.index % len(skin.note_colors)]
+        else:
+            color = skin.note_color
+
+        seed = ns.index * 2.399963
+        n = 10
+        for k in range(n):
+            angle = seed + k * (2.0 * math.pi / n) + (k % 3) * 0.31
+            spread = 0.75 + 0.05 * ((k * 37 + ns.index) % 6)
+            dist = r * (0.35 + 2.6 * burst) * spread
+            fx = cx + math.cos(angle) * dist
+            fy = cy + math.sin(angle) * dist
+            ps = max(1.0, r * 0.13 * (1.0 - burst))
+            # Alternate note-colored and hot-red fragments so the burst
+            # reads as a break even with white notes.
+            fill = color if k % 2 == 0 else (255, 80, 80)
+            draw.ellipse([fx - ps, fy - ps, fx + ps, fy + ps], fill=(*fill, alpha))
+
+
+def _draw_ghost_cursor(ctx, draw, t_ms, cursor_scene, ox, oy):
+    """The ghost-race opponent: a second replay's cursor with a short fading
+    dot trail, drawn in its own color under the main cursor. Projection uses
+    the *main* cursor for the parallax sway so both cursors live in the same
+    scene."""
+    g = ctx.ghost
+    replay = g["replay"]
+    color = g["color"]
+    base_r = ctx.playfield_size * 0.0278 * 0.9
+
+    steps = 14
+    fade_ms = 300.0
+    for i in range(steps, 0, -1):
+        frac = i / steps
+        gx, gy = replay.cursor_position_at(t_ms - fade_ms * frac)
+        px, py, _ = ctx.camera.project(gx, gy, 0.0, cursor_scene)
+        rr = base_r * (1.0 - frac * 0.8) * 0.8
+        alpha = int(130 * (1.0 - frac))
+        if rr < 0.5 or alpha <= 2:
+            continue
+        draw.ellipse([ox + px - rr, oy + py - rr, ox + px + rr, oy + py + rr],
+                     fill=(*color, alpha))
+
+    gx, gy = replay.cursor_position_at(t_ms)
+    px, py, _ = ctx.camera.project(gx, gy, 0.0, cursor_scene)
+    cx, cy = ox + px, oy + py
+    draw.ellipse([cx - base_r, cy - base_r, cx + base_r, cy + base_r],
+                 fill=(*color, 220), outline=(255, 255, 255, 110),
+                 width=max(1, int(base_r * 0.14)))
+
+
+def _draw_versus_panel(ctx, overlay, draw, state, replay, ox, oy, size):
+    """Ghost race side-by-side stats: one row per player (colored marker,
+    username, live accuracy and combo), on a translucent card under the
+    title block."""
+    g = ctx.ghost
+    ghost_state = g["timeline"].state_at(state.time_ms)
+    dx, dy = _element_offset(ctx, "versus", state.cursor_xy)
+
+    def _fmt(username, st):
+        acc = f"{st.accuracy_pct:.1f}".rstrip("0").rstrip(".")
+        return f"{username}   {acc}%   x{st.combo}"
+
+    rows = [((240, 240, 245), _fmt(replay.username, state)),
+            (g["color"], _fmt(g["replay"].username, ghost_state))]
+
+    font = ctx.font_small
+    row_h = font.size * 1.7
+    pad = font.size * 0.8
+    text_w = max(draw.textlength(text, font=font) for _, text in rows)
+    marker = font.size * 0.55
+    card_w = text_w + marker + pad * 3
+    card_h = row_h * len(rows) + pad
+    cx0 = ctx.width / 2 - card_w / 2 + dx
+    cy0 = ctx.height * 0.104 + dy
+
+    draw.rounded_rectangle([cx0, cy0, cx0 + card_w, cy0 + card_h],
+                           radius=card_h * 0.16, fill=(8, 10, 22, 130))
+    y = cy0 + pad * 0.7
+    for color, text in rows:
+        my = y + font.size / 2
+        draw.ellipse([cx0 + pad - marker / 2, my - marker / 2,
+                      cx0 + pad + marker / 2, my + marker / 2], fill=(*color, 255))
+        draw.text((cx0 + pad + marker, y), text, font=font, fill=(235, 238, 250, 235))
+        y += row_h
+
+
+def _draw_live_stats(ctx, overlay, draw, state, ox, oy, size):
+    """Live performance card (opt-in HUD element): rolling unstable rate and
+    mean offset over the recent hit window, plus a small timing histogram --
+    everything derived from state.recent_errors, the same data the hit-error
+    bar uses."""
+    from ..sim.hitreg import DEFAULT_WINDOW_MS
+
+    dx, dy = _element_offset(ctx, "stats", state.cursor_xy)
+    offsets = [o for _, o in state.recent_errors if o is not None]
+    if len(offsets) >= 2:
+        mean = sum(offsets) / len(offsets)
+        var = sum((o - mean) ** 2 for o in offsets) / (len(offsets) - 1)
+        ur = 10.0 * math.sqrt(var)
+    elif offsets:
+        mean, ur = offsets[0], 0.0
+    else:
+        mean, ur = 0.0, 0.0
+
+    card_w = size * 0.30
+    card_h = size * 0.30
+    x0 = ctx.width * 0.02 + dx
+    y0 = oy + size - card_h + dy
+    pad = card_w * 0.09
+
+    draw.rounded_rectangle([x0, y0, x0 + card_w, y0 + card_h],
+                           radius=card_h * 0.08, fill=(8, 10, 22, 130))
+
+    label_font = ctx.font_panel_label
+    value_font = ctx.font_panel_value
+    y = y0 + pad * 0.8
+    for label, value in (("UR", f"{ur:.0f}"), ("AVG", f"{mean:+.0f} ms")):
+        draw.text((x0 + pad, y), label, font=label_font, fill=(138, 138, 146, 255))
+        vw = draw.textlength(value, font=value_font)
+        draw.text((x0 + card_w - pad - vw, y - (value_font.size - label_font.size) / 2),
+                  value, font=value_font, fill=(255, 255, 255, 255))
+        y += value_font.size * 1.5
+
+    # Timing histogram of the recent hits: early on the left, late on the
+    # right, the same +/-DEFAULT_WINDOW_MS scale as the hit-error bar.
+    bins = [0] * 9
+    for o in offsets:
+        frac = max(-1.0, min(1.0, o / DEFAULT_WINDOW_MS))
+        bins[min(len(bins) - 1, int((frac + 1.0) / 2.0 * len(bins)))] += 1
+    hist_top = y + pad * 0.3
+    hist_bottom = y0 + card_h - pad * 0.8
+    hist_h = max(4.0, hist_bottom - hist_top)
+    bar_w = (card_w - pad * 2) / len(bins)
+    peak = max(bins) or 1
+    for i, count in enumerate(bins):
+        bx = x0 + pad + i * bar_w
+        bh = hist_h * count / peak
+        center_dist = abs(i - (len(bins) - 1) / 2.0) / ((len(bins) - 1) / 2.0)
+        color = (120, 230, 130) if center_dist <= 0.34 else \
+                (235, 200, 90) if center_dist <= 0.68 else (240, 120, 90)
+        draw.rectangle([bx + bar_w * 0.15, hist_bottom - bh,
+                        bx + bar_w * 0.85, hist_bottom],
+                       fill=(*color, 210 if count else 45))
+
+
+def _apply_dynamic_camera(ctx, state, img: Image.Image) -> Image.Image:
+    """Combo-driven zoom + miss shake, applied as one crop-and-resize of the
+    finished frame: the camera slowly pushes in as the combo builds (reset
+    on a break) and jolts for ~0.4s after a miss."""
+    zoom = 1.0 + min(state.combo, 150) / 150.0 * 0.035
+    shake_x = shake_y = 0.0
+    if state.last_miss_ms is not None:
+        dt = state.time_ms - state.last_miss_ms
+        if 0 <= dt <= 380:
+            k = 1.0 - dt / 380.0
+            amp = ctx.playfield_size * 0.018 * k
+            shake_x = math.sin(dt * 0.11) * amp
+            shake_y = math.cos(dt * 0.083) * amp
+            zoom += 0.012 * k
+
+    if zoom <= 1.0005 and abs(shake_x) < 0.5 and abs(shake_y) < 0.5:
+        return img
+
+    w, h = img.size
+    cw, ch = w / zoom, h / zoom
+    cx = min(max((w - cw) / 2 + shake_x, 0.0), w - cw)
+    cy = min(max((h - ch) / 2 + shake_y, 0.0), h - ch)
+    return img.resize((w, h), Image.BILINEAR, box=(cx, cy, cx + cw, cy + ch))
 
 
 def _draw_cursor_trail(ctx, overlay, draw, replay, t_ms, cursor_scene, ox, oy):
@@ -870,7 +1247,7 @@ def _draw_combo(ctx, overlay, draw, state, ox, oy, size):
     skin = ctx.skin
     if not skin.combo_text_enabled:
         return
-    dx, dy = _element_offset(ctx, "combo")
+    dx, dy = _element_offset(ctx, "combo", state.cursor_xy)
     combo_text = f"{state.combo}"
     tw = draw.textlength(combo_text, font=ctx.font_combo)
     tx = ox + dx + size / 2 - tw / 2
@@ -940,8 +1317,8 @@ def _draw_panel_card(ctx, overlay, draw, x_center, top_y, rows):
 
 def _draw_side_panels(ctx, overlay, draw, state, replay, ox, oy, size):
     skin = ctx.skin
-    ldx, ldy = _element_offset(ctx, "left_panel")
-    rdx, rdy = _element_offset(ctx, "right_panel")
+    ldx, ldy = _element_offset(ctx, "left_panel", state.cursor_xy)
+    rdx, rdy = _element_offset(ctx, "right_panel", state.cursor_xy)
     # Measured from the reference recording: panel text centers sit about
     # 0.24 playfield-widths outside the border, vertically ~47% down it.
     # Portrait canvases have no room beside the near-full-width playfield,
@@ -1007,7 +1384,7 @@ def _draw_title_block(ctx, draw, map_meta, replay, state, ox, oy, size):
     playfield, not under it."""
     w = ctx.width
     skin = ctx.skin
-    dx, dy = _element_offset(ctx, "title")
+    dx, dy = _element_offset(ctx, "title", state.cursor_xy)
 
     title = f"Watching {replay.username} play {map_meta.title}"
     tw = draw.textlength(title, font=ctx.font_title)
@@ -1063,7 +1440,7 @@ def _draw_health_bar(ctx, draw, state, replay, ox, oy, size):
     bar, then the current grade (with the speed-modifier suffix, e.g.
     "S--" at 0.8x) centered under it."""
     skin = ctx.skin
-    dx, dy = _element_offset(ctx, "health")
+    dx, dy = _element_offset(ctx, "health", state.cursor_xy)
     ox = ox + dx
     grade_y = oy + size + ctx.height * 0.028 + dy
 
@@ -1099,7 +1476,7 @@ def _draw_hit_error_bar(ctx, draw, state, ox, oy, size):
     from ..sim.hitreg import DEFAULT_WINDOW_MS
     from ..sim.timeline import ERROR_BAR_WINDOW_MS
 
-    dx, dy = _element_offset(ctx, "timing")
+    dx, dy = _element_offset(ctx, "timing", state.cursor_xy)
     half_w = size * 0.28
     cx = ox + size / 2 + dx
     cy = oy + size - size * 0.055 + dy

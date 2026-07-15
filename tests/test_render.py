@@ -125,6 +125,7 @@ class TestSegmentEncoderFallback(unittest.TestCase):
             1.0, 1.0, None, True, None, False, False, 1.0, "",
             True, None, True, 1.0, True, None,
             0.0, "filter", 0, 100.0 / 3, None, None, 0.4, 0.0, None,
+            None, 1.0,
         )
         return seg_path
 

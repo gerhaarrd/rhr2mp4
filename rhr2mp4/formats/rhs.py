@@ -4,7 +4,14 @@ Like .rhm, a .rhs is a plain zip archive:
   - "config"            -> JSON, `{"SettingName": {"Value": ...}, ...}` (142
                             keys covering nearly every visual/audio/online
                             setting the game has -- see `raw` below)
-  - "noteSkin/*.obj"     -> Wavefront mesh for the note shape (optional)
+  - "noteSkin/*.obj"     -> Wavefront mesh for the note shape (optional). The
+                            game only ever bundles one, but rhr2mp4 also
+                            accepts several numbered ones (e.g. "note_0.obj",
+                            "note_1.obj", ...) as an rhr2mp4-only extension:
+                            when more than one is present the note cycles
+                            through them as a looping animation instead of a
+                            static shape. A single file behaves exactly as
+                            before.
   - "borderSkin/*.png"   -> playfield border/frame texture (optional)
   - "hitSound/*.wav"     -> hit sound effect (optional)
   - "backgrounds/N/*.png" -> background character art, N matching the index
@@ -50,6 +57,10 @@ class BackgroundLayer:
     flip_horizontal: bool
     tint_rgb: tuple[int, int, int]
     tint_opacity: float
+    # Stable user-facing id ("1", "2", ... = the layer's position in the
+    # skin config): the zip filenames are hash-timestamp gibberish, so
+    # hide-this-image features (GUI right-click, --hide-assets) key on this.
+    name: str = ""
 
 
 @dataclass
@@ -167,6 +178,11 @@ class Skin:
     # also fill it from a user-supplied colorset .txt via parse_colorset().
     note_colors: list[tuple[int, int, int]] = field(default_factory=list)
 
+    # All noteSkin/*.obj files found, sorted by name (usually just one, same
+    # bytes as note_obj_bytes; see module docstring for the animation
+    # extension when there's more than one).
+    note_mesh_frames: list[bytes] = field(default_factory=list)
+
 
 def parse_colorset(text: str) -> list[tuple[int, int, int]]:
     """Parses a Rhythia colorset: hex colors (rrggbb, optional # prefix or
@@ -253,6 +269,11 @@ def _find_one(zf: zipfile.ZipFile, prefix: str) -> bytes | None:
     return None
 
 
+def _find_all(zf: zipfile.ZipFile, prefix: str) -> list[bytes]:
+    names = sorted(n for n in zf.namelist() if n.startswith(prefix) and not n.endswith("/"))
+    return [zf.read(n) for n in names]
+
+
 def _load_background_layers(zf: zipfile.ZipFile, raw: dict) -> list[BackgroundLayer]:
     entries = raw.get("BackgroundImages", []) or []
     layers: list[BackgroundLayer] = []
@@ -263,6 +284,7 @@ def _load_background_layers(zf: zipfile.ZipFile, raw: dict) -> list[BackgroundLa
         layers.append(
             BackgroundLayer(
                 image_bytes=image_bytes,
+                name=str(i + 1),
                 center_x=float(entry.get("CenterX", 0.5)),
                 center_y=float(entry.get("CenterY", 0.5)),
                 scale_x=float(entry.get("ScaleX", 0.3)),
@@ -286,7 +308,8 @@ def load(path: str) -> Skin:
         raw_wrapped = json.loads(raw_data)
         raw = {k: v.get("Value") for k, v in raw_wrapped.items()}
 
-        note_obj_bytes = _find_one(zf, "noteSkin/")
+        note_mesh_frames = _find_all(zf, "noteSkin/")
+        note_obj_bytes = note_mesh_frames[0] if note_mesh_frames else None
         border_image_bytes = _find_one(zf, "borderSkin/")
         cursor_image_bytes = _find_one(zf, "cursorSkin/")
         cursor_trail_image_bytes = _find_one(zf, "cursorTrailSkin/")
@@ -310,6 +333,7 @@ def load(path: str) -> Skin:
         miss_sound_bytes=miss_sound_bytes,
         background_layers=background_layers,
         note_colors=note_colors,
+        note_mesh_frames=note_mesh_frames,
         note_scale=float(raw.get("NoteScale", 1.0)),
         note_opacity=float(raw.get("NoteOpacity", 1.0)),
         approach_rate=float(raw.get("ApproachRate", 29.0)),
